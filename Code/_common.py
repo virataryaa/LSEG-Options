@@ -31,11 +31,16 @@ def make_logger(name: str, log_dir: Path):
     log_dir.mkdir(exist_ok=True)
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
+    logger.propagate = False  # don't let messages bubble to root, and don't catch root's (e.g. httpx's)
     logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt)
     fh = logging.FileHandler(log_dir / f"{name}.log", encoding="utf-8"); fh.setFormatter(fmt)
     logger.addHandler(sh); logger.addHandler(fh)
+    # lseg.data logs each HTTP request at INFO via the "httpx" logger; left
+    # unsuppressed this can flood the automator's status email (seen on KC,
+    # which previously used logging.basicConfig and leaked this onto root).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     return logger
 
 

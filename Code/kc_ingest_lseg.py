@@ -45,14 +45,21 @@ pd.set_option("future.no_silent_downcasting", True)  # silences a harmless lseg.
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout),
-              logging.FileHandler(LOG_DIR / "kc_ingest_lseg.log", encoding="utf-8")],
-)
-log = logging.getLogger(__name__)
+# A dedicated named logger (not logging.basicConfig on root) — basicConfig
+# attaches handlers to the root logger, which also catches lseg.data's
+# internal httpx request logging ("HTTP Request: GET ..." per RIC) since
+# that propagates to root by default. That bloated the automator's status
+# email to tens of thousands of lines. A named logger avoids the leak.
+_fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger("kc_ingest_lseg")
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _sh = logging.StreamHandler(sys.stdout); _sh.setFormatter(_fmt)
+    _fh = logging.FileHandler(LOG_DIR / "kc_ingest_lseg.log", encoding="utf-8"); _fh.setFormatter(_fmt)
+    log.addHandler(_sh)
+    log.addHandler(_fh)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 DB_DIR       = Path(__file__).parent.parent / "Database"
 DASH_DIR     = Path(__file__).parent.parent / "Dashboard"
