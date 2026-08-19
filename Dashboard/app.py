@@ -402,32 +402,33 @@ def _fn(v, f="{:,.0f}"):
     try: return f.format(float(v))
     except: return "—"
 
+# RIC reconstruction — LSEG scheme (interim migration), NOT the ICE
+# "<ROOT> <month><yy><C/P><strike>" scheme these were originally written
+# for. LSEG RICs are "1<ROOT><strike_encoded><month_code><yy>", with
+# A-L = Jan-Dec calls and M-X = Jan-Dec puts (see Code/_common.py /
+# Code/kc_ingest_lseg.py). Left as the ICE-style builders, this lookup
+# silently never matched our data's "ric" column, so every row's time
+# series panel showed "No data" — that's the bug being fixed here.
 def _ric_kc(strike, month, year, opt):
-    mc  = MONTH_TO_CODE[month]
-    yy  = f"{year % 100:02d}"
-    cp  = "C" if opt == "Call" else "P"
-    return f"KC {mc}{yy}{cp}{int(round(strike * 10))}"
+    code = CALL_CODES[month] if opt == "Call" else PUT_CODES[month]
+    yy   = f"{year % 100:02d}"
+    return f"1KC{int(round(strike * 100))}{code}{yy}"
 
 def _ric_cc(strike, month, year, opt):
-    """Strike stored as $/mt; convert back to $/cwt integer for the symbol."""
-    mc  = MONTH_TO_CODE[month]
-    yy  = f"{year % 100:02d}"
-    cp  = "C" if opt == "Call" else "P"
-    return f"CC {mc}{yy}{cp}{int(round(strike / 22.046))}"
+    """CC strikes are stored as whole $/mt already — no conversion needed."""
+    code = CALL_CODES[month] if opt == "Call" else PUT_CODES[month]
+    yy   = f"{year % 100:02d}"
+    return f"1CC{int(round(strike))}{code}{yy}"
 
 def _ric_sb(strike, month, year, opt):
-    """Strike stored as cts/lb; multiply by 100 for symbol integer."""
-    mc  = MONTH_TO_CODE[month]
-    yy  = f"{year % 100:02d}"
-    cp  = "C" if opt == "Call" else "P"
-    return f"SB {mc}{yy}{cp}{int(round(strike * 100))}"
+    code = CALL_CODES[month] if opt == "Call" else PUT_CODES[month]
+    yy   = f"{year % 100:02d}"
+    return f"1SB{int(round(strike * 100))}{code}{yy}"
 
 def _ric_ct(strike, month, year, opt):
-    """Strike stored as cts/lb integer directly."""
-    mc  = MONTH_TO_CODE[month]
-    yy  = f"{year % 100:02d}"
-    cp  = "C" if opt == "Call" else "P"
-    return f"CT {mc}{yy}{cp}{int(round(strike))}"
+    code = CALL_CODES[month] if opt == "Call" else PUT_CODES[month]
+    yy   = f"{year % 100:02d}"
+    return f"1CT{int(round(strike * 100))}{code}{yy}"
 
 
 # ── ATM time series (put-call parity) ─────────────────────────────────────────
