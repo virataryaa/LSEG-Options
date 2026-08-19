@@ -1,0 +1,1142 @@
+"""
+app.py — Soft Options Dashboard (ICE Connect data)
+===================================================
+Commodities : KC (Coffee C) | CC (Cocoa) | SB (Sugar #11)
+Sidebar     : Old Date + New Date (shared)
+Each Tab    : Min OI + ATM info + butterfly tables
+Inner Tab 1 : OI Change (left) | Volume (right)
+Inner Tab 2 : Px Change (left) | % Change (right)
+"""
+
+import json
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from pathlib import Path
+
+st.set_page_config(page_title="Options Dashboard", layout="wide")
+
+DB_PATH  = Path(__file__).parent.parent / "Database"
+ATM_JSON = Path(__file__).parent / "atm.json"
+FUT_PATH = Path(__file__).parent.parent / "Database" / "Futures"
+
+MONTH_NAMES    = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
+                  7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
+CALL_CODES     = {1:"A",2:"B",3:"C",4:"D",5:"E",6:"F",7:"G",8:"H",9:"I",10:"J",11:"K",12:"L"}
+PUT_CODES      = {1:"M",2:"N",3:"O",4:"P",5:"Q",6:"R",7:"S",8:"T",9:"U",10:"V",11:"W",12:"X"}
+MONTH_TO_CODE  = {1:"F",2:"G",3:"H",4:"J",5:"K",6:"M",7:"N",8:"Q",9:"U",10:"V",11:"X",12:"Z"}
+CODE_TO_MONTH_INT = {"F":1,"G":2,"H":3,"J":4,"K":5,"M":6,"N":7,"Q":8,"U":9,"V":10,"X":11,"Z":12}
+
+
+# ── Data loaders ───────────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800)
+def load_kc():
+    df = pd.read_parquet(DB_PATH / "KC_options_ice.parquet")
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+@st.cache_data(ttl=1800)
+def load_cc():
+    df = pd.read_parquet(DB_PATH / "CC_options_ice.parquet")
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+@st.cache_data(ttl=1800)
+def load_sb():
+    df = pd.read_parquet(DB_PATH / "SB_options_ice.parquet")
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+@st.cache_data(ttl=1800)
+def load_ct():
+    df = pd.read_parquet(DB_PATH / "CT_options_ice.parquet")
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+@st.cache_data(ttl=1800)
+def load_fut(name: str) -> pd.DataFrame:
+    """Load futures parquet for per-expiry ATM. Returns empty DF if unavailable (e.g. Streamlit Cloud)."""
+    path = FUT_PATH / f"{name}_futures.parquet"
+    try:
+        df = pd.read_parquet(path)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df["month_int"] = df["month"].map(CODE_TO_MONTH_INT)
+        return df[["Date", "month_int", "year", "settlement"]].dropna(subset=["settlement"])
+    except Exception:
+        return pd.DataFrame()
+
+def load_atm():
+    try:
+        with open(ATM_JSON) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _try_load(fn, name):
+    try:
+        return fn()
+    except Exception as e:
+        st.warning(f"Could not load {name} data: {e}")
+        return pd.DataFrame()
+
+
+df_kc    = _try_load(load_kc,  "KC")
+df_cc    = _try_load(load_cc,  "CC")
+df_sb    = _try_load(load_sb,  "SB")
+df_ct    = _try_load(load_ct,  "CT")
+atm_data = load_atm()
+
+all_dates = set()
+for _df in [df_kc, df_cc, df_sb, df_ct]:
+    if not _df.empty:
+        all_dates.update(_df["date"].dt.date.unique())
+available_dates = sorted(all_dates)
+
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("Options Dashboard")
+    st.divider()
+    old_date = st.selectbox("Old Date", available_dates,
+                             index=max(0, len(available_dates) - 10),
+                             format_func=lambda d: d.strftime("%d %b %Y"))
+    new_date = st.selectbox("New Date", available_dates,
+                             index=len(available_dates) - 1,
+                             format_func=lambda d: d.strftime("%d %b %Y"))
+    if old_date == new_date:
+        st.warning("Old Date and New Date are the same.")
+
+    st.divider()
+    st.markdown("**Latest data available**")
+    for _label, _df in [("KC", df_kc), ("CC", df_cc), ("SB", df_sb), ("CT", df_ct)]:
+        if not _df.empty:
+            _latest = _df["date"].max().date().strftime("%d %b %Y")
+            st.caption(f"{_label} — {_latest}")
+        else:
+            st.caption(f"{_label} — no data")
+
+
+# ── Pivot helpers (all parameterised) ─────────────────────────────────────────
+def _month_keys(df):
+    return (df[["expiry_month", "expiry_year"]]
+            .drop_duplicates()
+            .sort_values(["expiry_year", "expiry_month"])
+            .apply(lambda r: (int(r.expiry_month), int(r.expiry_year)), axis=1)
+            .tolist())
+
+def _meta(df, opt):
+    return (df[df["option_type"] == opt]
+            [["ric", "strike", "expiry_month", "expiry_year"]]
+            .drop_duplicates()
+            .assign(mk=lambda x: list(zip(x.expiry_month.astype(int), x.expiry_year.astype(int))))
+            .set_index("ric"))
+
+def _clean(pivot, month_keys):
+    if pivot.empty:
+        return pivot
+    pivot = pivot.reindex(columns=month_keys)
+    return pivot.apply(lambda c: pd.to_numeric(c, errors="coerce")).astype(float)
+
+def _valid(df, opt, new_date, min_oi):
+    if min_oi <= 0:
+        return None
+    d2 = df[(df["date"].dt.date == new_date) & (df["option_type"] == opt)][["ric", "oi"]]
+    return d2[pd.to_numeric(d2["oi"], errors="coerce") >= min_oi]["ric"]
+
+def _change_pivot(df, month_keys, opt, src, old_date, new_date, min_oi):
+    d1 = (df[(df["date"].dt.date == old_date) & (df["option_type"] == opt)]
+          [["ric", src]].set_index("ric"))
+    d2 = (df[(df["date"].dt.date == new_date) & (df["option_type"] == opt)]
+          [["ric", src]].set_index("ric"))
+    merged = d1.join(d2, how="outer", lsuffix="_1", rsuffix="_2")
+    merged["val"] = (pd.to_numeric(merged[src + "_2"], errors="coerce")
+                     - pd.to_numeric(merged[src + "_1"], errors="coerce"))
+    v = _valid(df, opt, new_date, min_oi)
+    if v is not None:
+        merged = merged[merged.index.isin(v)]
+    meta = _meta(df, opt)
+    result = merged.join(meta[["strike", "mk"]]).dropna(subset=["strike"])
+    result = result[result["mk"].notna()]
+    piv = result.pivot_table(index="strike", columns="mk", values="val", aggfunc="first")
+    return _clean(piv, month_keys).sort_index(ascending=False)
+
+def get_oi_pivot(df, month_keys, opt, old_date, new_date, min_oi):
+    return _change_pivot(df, month_keys, opt, "oi", old_date, new_date, min_oi)
+
+def get_px_pivot(df, month_keys, opt, old_date, new_date, min_oi):
+    return _change_pivot(df, month_keys, opt, "settle", old_date, new_date, min_oi)
+
+def get_vol_pivot(df, month_keys, opt, old_date, new_date, min_oi):
+    lo, hi = min(old_date, new_date), max(old_date, new_date)
+    sub = df[(df["option_type"] == opt)
+             & (df["date"].dt.date >= lo)
+             & (df["date"].dt.date <= hi)].copy()
+    v = _valid(df, opt, new_date, min_oi)
+    if v is not None:
+        sub = sub[sub["ric"].isin(v)]
+    sub["mk"] = list(zip(sub["expiry_month"].astype(int), sub["expiry_year"].astype(int)))
+    sub["volume"] = pd.to_numeric(sub["volume"], errors="coerce")
+    piv = sub.groupby(["strike", "mk"])["volume"].sum().unstack("mk")
+    return _clean(piv, month_keys).sort_index(ascending=False)
+
+def get_pct_pivot(df, month_keys, opt, old_date, new_date, min_oi):
+    d1 = (df[(df["date"].dt.date == old_date) & (df["option_type"] == opt)]
+          [["ric", "settle"]].set_index("ric"))
+    d2 = (df[(df["date"].dt.date == new_date) & (df["option_type"] == opt)]
+          [["ric", "settle"]].set_index("ric"))
+    merged = d1.join(d2, how="outer", lsuffix="_1", rsuffix="_2")
+    s1 = pd.to_numeric(merged["settle_1"], errors="coerce")
+    s2 = pd.to_numeric(merged["settle_2"], errors="coerce")
+    mask = (s1.fillna(0).abs() > 0)
+    merged["val"] = np.where(mask, ((s2 - s1) / s1.fillna(0).abs()) * 100, np.nan)
+    v = _valid(df, opt, new_date, min_oi)
+    if v is not None:
+        merged = merged[merged.index.isin(v)]
+    meta = _meta(df, opt)
+    result = merged.join(meta[["strike", "mk"]]).dropna(subset=["strike"])
+    result = result[result["mk"].notna()]
+    piv = result.pivot_table(index="strike", columns="mk", values="val", aggfunc="first")
+    return _clean(piv, month_keys).sort_index(ascending=False)
+
+def get_iv_pivot(df, month_keys, opt, snap_date, min_oi):
+    """Snapshot of ImpVol by strike × expiry on snap_date."""
+    if "impvol" not in df.columns:
+        return pd.DataFrame()
+    d = (df[(df["date"].dt.date == snap_date) & (df["option_type"] == opt)]
+         [["ric", "impvol"]].set_index("ric"))
+    d["impvol"] = pd.to_numeric(d["impvol"], errors="coerce")
+    meta = _meta(df, opt)
+    result = d.join(meta[["strike", "mk"]]).dropna(subset=["strike", "impvol"])
+    result = result[result["mk"].notna()]
+    piv = result.pivot_table(index="strike", columns="mk", values="impvol", aggfunc="first")
+    return _clean(piv, month_keys).sort_index(ascending=False)
+
+def get_iv_change_pivot(df, month_keys, opt, old_date, new_date, min_oi):
+    """ImpVol change (new − old) by strike × expiry."""
+    if "impvol" not in df.columns:
+        return pd.DataFrame()
+    d1 = (df[(df["date"].dt.date == old_date) & (df["option_type"] == opt)]
+          [["ric", "impvol"]].set_index("ric"))
+    d2 = (df[(df["date"].dt.date == new_date) & (df["option_type"] == opt)]
+          [["ric", "impvol"]].set_index("ric"))
+    merged = d1.join(d2, how="outer", lsuffix="_1", rsuffix="_2")
+    merged["val"] = (pd.to_numeric(merged["impvol_2"], errors="coerce")
+                     - pd.to_numeric(merged["impvol_1"], errors="coerce"))
+    meta = _meta(df, opt)
+    result = merged.join(meta[["strike", "mk"]]).dropna(subset=["strike"])
+    result = result[result["mk"].notna()]
+    piv = result.pivot_table(index="strike", columns="mk", values="val", aggfunc="first")
+    return _clean(piv, month_keys).sort_index(ascending=False)
+
+def get_oi_snapshot_pivot(df, month_keys, opt, snap_date, new_date, min_oi):
+    d = (df[(df["date"].dt.date == snap_date) & (df["option_type"] == opt)]
+         [["ric", "oi"]].set_index("ric"))
+    d = d.copy()
+    d["oi"] = pd.to_numeric(d["oi"], errors="coerce")
+    v = _valid(df, opt, new_date, min_oi)
+    if v is not None:
+        d = d[d.index.isin(v)]
+    meta = _meta(df, opt)
+    result = d.join(meta[["strike", "mk"]]).dropna(subset=["strike"])
+    result = result[result["mk"].notna()]
+    piv = result.pivot_table(index="strike", columns="mk", values="oi", aggfunc="first")
+    return _clean(piv, month_keys).sort_index(ascending=False)
+
+
+# ── Colors ─────────────────────────────────────────────────────────────────────
+def _alpha(v, mx): return round(0.15 + min(abs(float(v)) / max(mx, 0.01), 1.0) * 0.50, 2)
+
+def oi_color(val, mx):
+    if pd.isna(val) or val == 0: return ""
+    a = _alpha(val, mx)
+    return (f"background:rgba(66,133,244,{a});color:#1a1a2e" if val > 0
+            else f"background:rgba(220,75,75,{a});color:#1a1a2e")
+
+def vol_color(val, mx):
+    if pd.isna(val) or val == 0: return ""
+    a = _alpha(val, mx)
+    return f"background:rgba(66,133,244,{a});color:#1a1a2e"
+
+def px_color(val, mx):
+    if pd.isna(val) or val == 0: return ""
+    a = _alpha(val, mx)
+    return (f"background:rgba(52,168,83,{a});color:#1a1a2e" if val > 0
+            else f"background:rgba(220,75,75,{a});color:#1a1a2e")
+
+def iv_color(val, mx):
+    """ImpVol level — heat map: low=blue, high=orange."""
+    if pd.isna(val) or val == 0: return ""
+    a = round(0.15 + min(float(val) / max(mx, 0.01), 1.0) * 0.65, 2)
+    return f"background:rgba(234,88,12,{a});color:#1a1a2e"
+
+def iv_chg_color(val, mx):
+    """IV change — green=vol fell, red=vol rose."""
+    if pd.isna(val) or val == 0: return ""
+    a = _alpha(val, mx)
+    return (f"background:rgba(220,75,75,{a});color:#1a1a2e" if val > 0
+            else f"background:rgba(52,168,83,{a});color:#1a1a2e")
+
+
+# ── Butterfly HTML ─────────────────────────────────────────────────────────────
+_CSS = """<style>
+.bft{border-collapse:collapse;font-size:11px;font-family:-apple-system,sans-serif}
+.bft th,.bft td{white-space:nowrap;padding:2px 5px}
+.bft th{font-weight:600;letter-spacing:.03em;font-size:10px;text-align:center}
+.bft td{text-align:right;border:1px solid #f0f0f0;color:#1a1a2e}
+.bft .sc{text-align:center;font-weight:700;font-size:11px;color:#1a1a2e;
+         background:#f5f5f5;border-left:2px solid #ccc;border-right:2px solid #ccc}
+.bft .sc-atm{background:#f59e0b!important;color:#1a1a2e!important;font-weight:900!important}
+.bft tr.atm-row td{border-top:2px solid #f59e0b!important;border-bottom:2px solid #f59e0b!important}
+.bft tfoot td{font-weight:700;border-top:2px solid #bbb}
+.bft tfoot .sc{font-size:9px;color:#888;background:#efefef}
+.ch{background:#dce8fb;color:#1a56cc}
+.ph{background:#fde8e8;color:#c0392b}
+.kch{background:#ebebeb;color:#555}
+</style>"""
+
+
+def butterfly_html(cpiv, ppiv, atm, cfn, month_keys, fmt="{:.0f}",
+                   footer=True, sfx="", title="", atm_tol=None, fixed_strikes=None,
+                   snap_tol=None):
+    ccols = list(reversed(month_keys))
+    pcols = list(month_keys)
+
+    if fixed_strikes is not None:
+        strikes = list(fixed_strikes)  # caller controls order (asc = low at top, ATM centered)
+    else:
+        strikes_set = set()
+        if not cpiv.empty: strikes_set.update(cpiv.index.tolist())
+        if not ppiv.empty: strikes_set.update(ppiv.index.tolist())
+        strikes = sorted(strikes_set)  # low to high
+
+    if atm_tol is None:
+        if len(strikes) >= 2:
+            gaps = [abs(strikes[i] - strikes[i+1]) for i in range(len(strikes)-1)]
+            atm_tol = min(gaps) * 0.6
+        else:
+            atm_tol = 1.0
+
+    def _flat(p):
+        if p.empty: return np.array([], dtype=float)
+        return p.values.astype(float).flatten()
+
+    av = np.concatenate([_flat(cpiv), _flat(ppiv)])
+    av = av[~np.isnan(av)]
+    mx = float(np.max(np.abs(av))) if len(av) > 0 else 1.0
+
+    nc, np_ = len(ccols), len(pcols)
+
+    h1 = (f'<tr><th colspan="{nc}" class="ch">Call</th>'
+          f'<th class="kch">{title}</th>'
+          f'<th colspan="{np_}" class="ph">Put</th></tr>')
+
+    h2 = ('<tr>'
+          + "".join(f'<th class="ch" style="color:#999;font-weight:400">'
+                    f'{CALL_CODES[m]}{str(y)[-2:]}</th>' for m, y in ccols)
+          + '<th class="kch"></th>'
+          + "".join(f'<th class="ph" style="color:#ccc;font-weight:400">'
+                    f'{PUT_CODES[m]}{str(y)[-2:]}</th>' for m, y in pcols)
+          + '</tr>')
+
+    h3 = ('<tr>'
+          + "".join(f'<th class="ch">{MONTH_NAMES[m]}</th>' for m, y in ccols)
+          + '<th class="kch"></th>'
+          + "".join(f'<th class="ph">{MONTH_NAMES[m]}</th>' for m, y in pcols)
+          + '</tr>')
+
+    _piv_idx_cache = {}
+    def cv(piv, s, mk):
+        if piv.empty or mk not in piv.columns: return np.nan
+        # nearest-key lookup within snap_tol (tolerates display grid ≠ data grid)
+        if snap_tol is not None:
+            pid = id(piv)
+            if pid not in _piv_idx_cache:
+                _piv_idx_cache[pid] = np.array(piv.index.tolist(), dtype=float)
+            idx_arr = _piv_idx_cache[pid]
+            if len(idx_arr) == 0: return np.nan
+            diffs = np.abs(idx_arr - s)
+            if diffs.min() > snap_tol: return np.nan
+            s = idx_arr[diffs.argmin()]
+        elif s not in piv.index:
+            return np.nan
+        v = piv.at[s, mk]
+        return float(v) if not pd.isna(v) else np.nan
+
+    def td(v):
+        style = cfn(v, mx)
+        txt = (fmt.format(v) + sfx) if not np.isnan(v) and v != 0 else ""
+        return f'<td style="{style}">{txt}</td>'
+
+    body = []
+    for s in strikes:
+        is_atm = atm is not None and abs(s - atm) < atm_tol
+        sc     = "sc sc-atm" if is_atm else "sc"
+        tr_cls = ' class="atm-row"' if is_atm else ""
+        lbl    = int(s) if s == int(s) else s
+        row = ("".join(td(cv(cpiv, s, mk)) for mk in ccols)
+               + f'<td class="{sc}">{lbl}</td>'
+               + "".join(td(cv(ppiv, s, mk)) for mk in pcols))
+        body.append(f"<tr{tr_cls}>{row}</tr>")
+
+    ft = ""
+    if footer:
+        def cs(piv, mk):
+            if piv.empty or mk not in piv.columns: return 0.0
+            return float(piv[mk].sum(skipna=True))
+        cft = "".join(td(cs(cpiv, mk)) for mk in ccols)
+        pft = "".join(td(cs(ppiv, mk)) for mk in pcols)
+        ft = (f'<tfoot><tr>{cft}'
+              f'<td class="sc" style="font-size:9px;color:#888">TOT</td>'
+              f'{pft}</tr></tfoot>')
+
+    est_h = max(400, (len(strikes) + 4) * 22 + 90)
+    return (f'{_CSS}<div style="overflow-x:auto;overflow-y:auto;max-height:{est_h}px">'
+            f'<table class="bft"><thead>{h1}{h2}{h3}</thead>'
+            f'{ft}<tbody>{"".join(body)}</tbody></table></div>')
+
+
+# ── Misc helpers ───────────────────────────────────────────────────────────────
+def _tot(piv): return float(piv.sum(skipna=True).sum()) if not piv.empty else 0.0
+def _fn(v, f="{:,.0f}"):
+    try: return f.format(float(v))
+    except: return "—"
+
+def _ric_kc(strike, month, year, opt):
+    mc  = MONTH_TO_CODE[month]
+    yy  = f"{year % 100:02d}"
+    cp  = "C" if opt == "Call" else "P"
+    return f"KC {mc}{yy}{cp}{int(round(strike * 10))}"
+
+def _ric_cc(strike, month, year, opt):
+    """Strike stored as $/mt; convert back to $/cwt integer for the symbol."""
+    mc  = MONTH_TO_CODE[month]
+    yy  = f"{year % 100:02d}"
+    cp  = "C" if opt == "Call" else "P"
+    return f"CC {mc}{yy}{cp}{int(round(strike / 22.046))}"
+
+def _ric_sb(strike, month, year, opt):
+    """Strike stored as cts/lb; multiply by 100 for symbol integer."""
+    mc  = MONTH_TO_CODE[month]
+    yy  = f"{year % 100:02d}"
+    cp  = "C" if opt == "Call" else "P"
+    return f"SB {mc}{yy}{cp}{int(round(strike * 100))}"
+
+def _ric_ct(strike, month, year, opt):
+    """Strike stored as cts/lb integer directly."""
+    mc  = MONTH_TO_CODE[month]
+    yy  = f"{year % 100:02d}"
+    cp  = "C" if opt == "Call" else "P"
+    return f"CT {mc}{yy}{cp}{int(round(strike))}"
+
+
+# ── ATM time series (put-call parity) ─────────────────────────────────────────
+def get_atm_ts(df: pd.DataFrame) -> pd.DataFrame:
+    """For each date × expiry, find the strike where |call_settle - put_settle| is
+    minimised (put-call parity ⟹ that strike = underlying price).  Returns a
+    DataFrame with columns [date, expiry, atm_strike]."""
+    calls = (df[df["option_type"] == "Call"]
+             [["date", "expiry_month", "expiry_year", "strike", "settle"]]
+             .dropna(subset=["settle"]))
+    puts  = (df[df["option_type"] == "Put"]
+             [["date", "expiry_month", "expiry_year", "strike", "settle"]]
+             .dropna(subset=["settle"]))
+    merged = calls.merge(puts,
+                         on=["date", "expiry_month", "expiry_year", "strike"],
+                         suffixes=("_c", "_p"))
+    if merged.empty:
+        return pd.DataFrame(columns=["date", "expiry", "atm_strike"])
+    merged["diff"] = (merged["settle_c"] - merged["settle_p"]).abs()
+    idx = merged.groupby(["date", "expiry_month", "expiry_year"])["diff"].idxmin()
+    best = merged.loc[idx].copy()
+    best["expiry"]     = (best["expiry_month"].map(MONTH_NAMES)
+                          + " '" + best["expiry_year"].astype(str).str[-2:])
+    best["atm_strike"] = best["strike"]
+    return best[["date", "expiry", "atm_strike"]].sort_values("date")
+
+
+# ── Commodity tab renderer ─────────────────────────────────────────────────────
+def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
+                         key_prefix, title, ric_fn, display_step=None, mround_default=None,
+                         ingest_note="", fut_df=None):
+    if df.empty:
+        st.info(f"No data available for {title}.")
+        return
+
+    month_keys       = _month_keys(df)
+    all_strikes_data = sorted(df["strike"].unique())  # ascending, for step inference
+    atm_updated      = atm_data.get("updated", "—")
+
+    # Initial display grid (overridden below once user inputs are read)
+    if atm_val is not None and len(all_strikes_data) > 1:
+        if display_step is not None:
+            step = display_step
+        else:
+            diffs = [all_strikes_data[i+1] - all_strikes_data[i]
+                     for i in range(len(all_strikes_data)-1)]
+            step = sorted(diffs)[len(diffs)//2]
+    else:
+        step = 1.0
+    snap_tol = step / 2
+
+    _def_step   = float(display_step if display_step else (step if atm_val is not None and len(all_strikes_data) > 1 else 1.0))
+    _def_mround = float(mround_default if mround_default is not None else _def_step)
+
+    with st.expander("Controls", expanded=True):
+        col_oi, col_price, col_mround, col_step, col_mode = st.columns([1, 1.2, 0.8, 0.8, 1.4])
+        with col_oi:
+            min_oi = st.number_input("Min OI filter (New Date)", value=0, min_value=0,
+                                      step=10, key=f"{key_prefix}_min_oi",
+                                      help="Hide strikes where Open Interest on the New Date is below this threshold.")
+        with col_price:
+            raw_price = st.number_input(
+                "Price", value=float(atm_val) if atm_val is not None else 0.0,
+                format="%.2f", key=f"{key_prefix}_raw_price",
+                help="Raw market price (e.g. last futures settle). The table centers on MROUND(Price, MRound)."
+            )
+        with col_mround:
+            mround_val = st.number_input(
+                "MRound", value=_def_mround, min_value=0.01,
+                format="%.2f", key=f"{key_prefix}_mround",
+                help=(
+                    "Rounding multiple for the ATM. Center ATM = nearest multiple of this value to Price "
+                    "(e.g. Price=302.5, MRound=50 → ATM=300).\n\n"
+                    + (f"Ingest uses: {ingest_note}" if ingest_note else "")
+                )
+            )
+        with col_step:
+            custom_step = st.number_input(
+                "Step", value=_def_step, min_value=0.01,
+                format="%.2f", key=f"{key_prefix}_custom_step",
+                help=(
+                    "Strike ladder increment — gap between rows in the table.\n\n"
+                    + (f"Ingest uses: {ingest_note}" if ingest_note else "")
+                )
+            )
+        with col_mode:
+            strike_mode = st.radio(
+                "Strike mode", ["Nearest", "Exact"],
+                index=0, horizontal=True,
+                key=f"{key_prefix}_strike_mode",
+                help=(
+                    "Nearest: grid rows at exact step intervals, data pulled from the "
+                    "closest parquet strike within Step/2 — clean uniform ladder.\n\n"
+                    "Exact: rows are the actual ICE strikes from the parquet, centered "
+                    "on ATM — no interpolation, raw exchange data only."
+                )
+            )
+
+        # ATM center = MROUND(price, mround)
+        custom_atm = round(raw_price / mround_val) * mround_val if mround_val > 0 else raw_price
+        st.caption(
+            f"Center ATM: **{custom_atm:,.2f}** = MROUND({raw_price:,.2f}, {mround_val:,.2f})  |  "
+            f"ATM ({title}): **{atm_label}** as of {atm_updated}  |  "
+            f"Data: {df['date'].min().date()} to {df['date'].max().date()}"
+        )
+
+    # Build strike grid based on mode
+    N = 35
+    if strike_mode == "Nearest":
+        # Pure arithmetic grid — data fetched via nearest-key lookup (snap_tol = step/2)
+        all_strikes = [round(custom_atm + i * custom_step, 6)
+                       for i in range(-N, N+1)
+                       if custom_atm + i * custom_step > 0]
+        snap_tol = custom_step / 2
+    else:
+        # Exact mode — use actual parquet strikes centered on ATM
+        snap = {}
+        for s in all_strikes_data:
+            bucket = round((s - custom_atm) / custom_step)
+            if bucket not in snap or abs(s - custom_atm) < abs(snap[bucket] - custom_atm):
+                snap[bucket] = s
+        all_strikes = sorted([snap[b] for b in range(-N, N+1) if b in snap])
+        snap_tol = None  # exact lookup only
+
+    call_oi  = get_oi_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
+    put_oi   = get_oi_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
+    call_vol = get_vol_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
+    put_vol  = get_vol_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
+
+    c_oi  = _tot(call_oi);  p_oi  = _tot(put_oi)
+    c_vol = _tot(call_vol); p_vol = _tot(put_vol)
+    cp_oi  = f"{abs(c_oi/p_oi):.2f}"  if p_oi  != 0 else "—"
+    cp_vol = f"{c_vol/p_vol:.2f}"     if p_vol > 0  else "—"
+
+    items = [
+        ("Call OI Delta", _fn(c_oi)),
+        ("Put OI Delta",  _fn(p_oi)),
+        ("Call Volume",   _fn(c_vol)),
+        ("Put Volume",    _fn(p_vol)),
+        ("C/P OI Ratio",  cp_oi),
+        ("C/P Vol Ratio", cp_vol),
+    ]
+    st.markdown(
+        '<div style="display:flex;gap:28px;padding:6px 0 12px;border-bottom:1px solid #eee;flex-wrap:wrap">'
+        + "".join(
+            f'<div><div style="font-size:9px;color:#888;letter-spacing:.07em;'
+            f'text-transform:uppercase;margin-bottom:2px">{lbl}</div>'
+            f'<div style="font-size:14px;font-weight:600;color:#1a1a2e">{val}</div></div>'
+            for lbl, val in items
+        )
+        + '</div>',
+        unsafe_allow_html=True
+    )
+
+    has_iv = "impvol" in df.columns and df["impvol"].notna().any()
+    tab_labels = ["OI Change + Volume", "Px Change"] + (["Vol Surface"] if has_iv else [])
+    inner_tabs  = st.tabs(tab_labels)
+    inner1, inner2 = inner_tabs[0], inner_tabs[1]
+    inner3 = inner_tabs[2] if has_iv else None
+
+    with inner1:
+        cl, cr = st.columns(2)
+        with cl:
+            st.markdown("**OI Change**")
+            st.markdown(
+                butterfly_html(call_oi, put_oi, custom_atm, oi_color, month_keys,
+                               fmt="{:.0f}", footer=True, title=title,
+                               fixed_strikes=all_strikes, snap_tol=snap_tol),
+                unsafe_allow_html=True)
+        with cr:
+            st.markdown("**Volume**")
+            st.markdown(
+                butterfly_html(call_vol, put_vol, custom_atm, vol_color, month_keys,
+                               fmt="{:.0f}", footer=True, title=title,
+                               fixed_strikes=all_strikes, snap_tol=snap_tol),
+                unsafe_allow_html=True)
+
+        with st.expander("OI Snapshot — Old Date vs New Date"):
+            call_oi_old = get_oi_snapshot_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
+            put_oi_old  = get_oi_snapshot_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
+            call_oi_new = get_oi_snapshot_pivot(df, month_keys, "Call", new_date, new_date, min_oi)
+            put_oi_new  = get_oi_snapshot_pivot(df, month_keys, "Put",  new_date, new_date, min_oi)
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.markdown(f"**Old Date — {old_date.strftime('%d %b %Y')}**")
+                st.markdown(
+                    butterfly_html(call_oi_old, put_oi_old, custom_atm, vol_color, month_keys,
+                                   fmt="{:.0f}", footer=False, title=title,
+                                   fixed_strikes=all_strikes, snap_tol=snap_tol),
+                    unsafe_allow_html=True)
+            with sc2:
+                st.markdown(f"**New Date — {new_date.strftime('%d %b %Y')}**")
+                st.markdown(
+                    butterfly_html(call_oi_new, put_oi_new, custom_atm, vol_color, month_keys,
+                                   fmt="{:.0f}", footer=False, title=title,
+                                   fixed_strikes=all_strikes, snap_tol=snap_tol),
+                    unsafe_allow_html=True)
+
+        with st.expander("Drill Down — Single Option Time Series"):
+            call_dd_piv = get_oi_snapshot_pivot(df, month_keys, "Call", new_date, new_date, min_oi)
+            put_dd_piv  = get_oi_snapshot_pivot(df, month_keys, "Put",  new_date, new_date, min_oi)
+
+            col_labels = {mk: f"{MONTH_NAMES[mk[0]]} '{str(mk[1])[-2:]}" for mk in month_keys}
+            mk_lookup  = {v: k for k, v in col_labels.items()}
+
+            def _flat_list(piv):
+                rows = []
+                for strike in sorted(piv.index):
+                    for mk in month_keys:
+                        if mk not in piv.columns:
+                            continue
+                        try:
+                            v = float(piv.at[strike, mk])
+                        except (TypeError, ValueError):
+                            continue
+                        if np.isnan(v) or v <= 0:
+                            continue
+                        rows.append({"Strike": strike, "Expiry": col_labels[mk], "OI": int(v)})
+                return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Strike", "Expiry", "OI"])
+
+            def _style_oi(s, rgb):
+                mx = s.max() if len(s) > 0 else 1.0
+                if pd.isna(mx) or mx == 0: mx = 1.0
+                return [f"background-color:rgba({rgb},{round(0.15+min(v/mx,1.0)*0.5,2)});color:#1a1a2e"
+                        if pd.notna(v) and v > 0 else "" for v in s]
+
+            call_flat = _flat_list(call_dd_piv)
+            put_flat  = _flat_list(put_dd_piv)
+
+            all_expiries = [col_labels[mk] for mk in month_keys]
+            fc1, fc2 = st.columns([1, 3])
+            with fc1:
+                exp_filter = st.selectbox("Filter by Expiry", ["All"] + all_expiries,
+                                          key=f"{key_prefix}_dd_exp_filter")
+
+            if exp_filter != "All":
+                call_show = call_flat[call_flat["Expiry"] == exp_filter].reset_index(drop=True)
+                put_show  = put_flat[put_flat["Expiry"]  == exp_filter].reset_index(drop=True)
+            else:
+                call_show, put_show = call_flat, put_flat
+
+            st.caption(f"OI as of **{new_date.strftime('%d %b %Y')}** — click a row to view its time series")
+            ddc1, ddc2 = st.columns(2)
+
+            def _fmt_strike(x):
+                return f"{x:.1f}" if x % 1 != 0 else f"{int(x)}"
+
+            with ddc1:
+                st.markdown("**Calls**")
+                call_evt = st.dataframe(
+                    call_show.style.apply(_style_oi, rgb="66,133,244", subset=["OI"])
+                             .format({"Strike": _fmt_strike, "OI": "{:,}"}),
+                    on_select="rerun", selection_mode="single-row",
+                    key=f"{key_prefix}_dd_call", use_container_width=True, hide_index=True,
+                )
+            with ddc2:
+                st.markdown("**Puts**")
+                put_evt = st.dataframe(
+                    put_show.style.apply(_style_oi, rgb="220,75,75", subset=["OI"])
+                            .format({"Strike": _fmt_strike, "OI": "{:,}"}),
+                    on_select="rerun", selection_mode="single-row",
+                    key=f"{key_prefix}_dd_put", use_container_width=True, hide_index=True,
+                )
+
+            sel_type = sel_strike = sel_mk = None
+            c_rows = call_evt.selection.get("rows", [])
+            p_rows = put_evt.selection.get("rows", [])
+
+            if c_rows and not call_show.empty:
+                row = call_show.iloc[c_rows[0]]
+                sel_type, sel_strike, sel_mk = "Call", row["Strike"], mk_lookup.get(row["Expiry"])
+            elif p_rows and not put_show.empty:
+                row = put_show.iloc[p_rows[0]]
+                sel_type, sel_strike, sel_mk = "Put", row["Strike"], mk_lookup.get(row["Expiry"])
+
+            if sel_type and sel_strike is not None and sel_mk:
+                ric = ric_fn(sel_strike, sel_mk[0], sel_mk[1], sel_type)
+                rdf = df[df["ric"] == ric].sort_values("date")
+                strike_lbl = _fmt_strike(sel_strike)
+                exp_lbl    = f"{MONTH_NAMES[sel_mk[0]]} '{str(sel_mk[1])[-2:]}"
+                friendly   = f"{title} {exp_lbl} {strike_lbl} {sel_type} ({ric})"
+                st.caption(f"**{friendly}** — {len(rdf)} trading days")
+                if rdf.empty:
+                    st.info(f"No data for {ric}")
+                else:
+                    show_iv = has_iv and "impvol" in rdf.columns and rdf["impvol"].notna().any()
+                    cc1, cc2, cc3, cc4 = st.columns(4 if show_iv else 3)
+                    fields = [
+                        (cc1, "oi",     "Open Interest"),
+                        (cc2, "volume", "Volume"),
+                        (cc3, "settle", "Settle Price"),
+                    ]
+                    if show_iv:
+                        fields.append((cc4, "impvol", "Impl. Vol %"))
+                    for col, field, label in fields:
+                        s = pd.to_numeric(rdf.set_index("date")[field], errors="coerce").dropna()
+                        if not s.empty:
+                            col.markdown(f"**{label}**")
+                            if field == "volume":
+                                col.bar_chart(s)
+                            else:
+                                col.line_chart(s)
+            else:
+                st.caption("Click any row above to view its time series.")
+
+        with st.expander("OI & Volume Time Series — All Strikes"):
+            all_d = sorted(df["date"].dt.date.unique())
+            if len(all_d) >= 2:
+                dr = st.slider("Date Range", min_value=all_d[0], max_value=all_d[-1],
+                               value=(all_d[0], all_d[-1]), key=f"{key_prefix}_ts_dr")
+                sub = df[(df["date"].dt.date >= dr[0]) & (df["date"].dt.date <= dr[1])].copy()
+                daily = (sub.groupby(["date", "option_type"])
+                         .agg(oi=("oi", "sum"), volume=("volume", "sum"))
+                         .reset_index())
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    st.markdown("**Call / Put OI**")
+                    oi_w = daily.pivot(index="date", columns="option_type", values="oi")
+                    oi_w.columns.name = None
+                    st.line_chart(oi_w.rename(columns={"Call": "Call OI", "Put": "Put OI"}))
+                with tc2:
+                    st.markdown("**Call / Put Volume**")
+                    vol_w = daily.pivot(index="date", columns="option_type", values="volume")
+                    vol_w.columns.name = None
+                    st.line_chart(vol_w.rename(columns={"Call": "Call Vol", "Put": "Put Vol"}))
+
+        with st.expander("ATM Time Series — Implied from Put-Call Parity"):
+            atm_ts = get_atm_ts(df)
+            if atm_ts.empty:
+                st.info("Not enough paired call/put data to compute ATM time series.")
+            else:
+                expiries_avail = sorted(atm_ts["expiry"].unique())
+                sel_expiries = st.multiselect(
+                    "Expiries to show", expiries_avail,
+                    default=expiries_avail[:3],
+                    key=f"{key_prefix}_atm_ts_exp"
+                )
+                plot_df = (atm_ts[atm_ts["expiry"].isin(sel_expiries)]
+                           .pivot(index="date", columns="expiry", values="atm_strike"))
+                plot_df.columns.name = None
+                if not plot_df.empty:
+                    st.line_chart(plot_df)
+                    st.caption(
+                        "Strike where |call settle − put settle| is smallest on each date — "
+                        "tracks the underlying futures price via put-call parity."
+                    )
+
+    with inner2:
+        call_px  = get_px_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
+        put_px   = get_px_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
+        call_pct = get_pct_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
+        put_pct  = get_pct_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
+
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            st.markdown("**Px Change**")
+            st.markdown(
+                butterfly_html(call_px, put_px, custom_atm, px_color, month_keys,
+                               fmt="{:.2f}", footer=False, title=title,
+                               fixed_strikes=all_strikes, snap_tol=snap_tol),
+                unsafe_allow_html=True)
+        with pc2:
+            st.markdown("**% Change**")
+            st.markdown(
+                butterfly_html(call_pct, put_pct, custom_atm, px_color, month_keys,
+                               fmt="{:.1f}", footer=False, sfx="%", title=title,
+                               fixed_strikes=all_strikes, snap_tol=snap_tol),
+                unsafe_allow_html=True)
+
+    if inner3 is not None:
+        with inner3:
+            # ── Row 1: ImpVol snapshot + IV Change butterflies ────────────────
+            vc1, vc2 = st.columns(2)
+            call_iv     = get_iv_pivot(df, month_keys, "Call", new_date, min_oi)
+            put_iv      = get_iv_pivot(df, month_keys, "Put",  new_date, min_oi)
+            call_iv_chg = get_iv_change_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
+            put_iv_chg  = get_iv_change_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
+
+            with vc1:
+                st.markdown(f"**ImpVol Snapshot — {new_date.strftime('%d %b %Y')}**")
+                st.markdown(
+                    butterfly_html(call_iv, put_iv, custom_atm, iv_color, month_keys,
+                                   fmt="{:.1f}", sfx="%", footer=False, title=title,
+                                   fixed_strikes=all_strikes, snap_tol=snap_tol),
+                    unsafe_allow_html=True)
+            with vc2:
+                st.markdown(f"**IV Change — {old_date.strftime('%d %b %Y')} → {new_date.strftime('%d %b %Y')}**")
+                st.markdown(
+                    butterfly_html(call_iv_chg, put_iv_chg, custom_atm, iv_chg_color, month_keys,
+                                   fmt="{:+.1f}", sfx="%", footer=False, title=title,
+                                   fixed_strikes=all_strikes, snap_tol=snap_tol),
+                    unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── Row 2: Vol Smile chart ────────────────────────────────────────
+            with st.expander("Vol Smile — ImpVol by Strike", expanded=True):
+                col_labels = {mk: f"{MONTH_NAMES[mk[0]]} '{str(mk[1])[-2:]}" for mk in month_keys}
+                smile_exp  = st.selectbox(
+                    "Expiry", [col_labels[mk] for mk in month_keys],
+                    key=f"{key_prefix}_smile_exp"
+                )
+                mk_lookup_smile = {v: k for k, v in col_labels.items()}
+                sel_mk = mk_lookup_smile.get(smile_exp)
+
+                if sel_mk:
+                    sub_iv = df[
+                        (df["date"].dt.date == new_date) &
+                        (df["expiry_month"] == sel_mk[0]) &
+                        (df["expiry_year"]  == sel_mk[1]) &
+                        df["impvol"].notna()
+                    ].copy()
+
+                    if not sub_iv.empty:
+                        calls_smile = sub_iv[sub_iv["option_type"] == "Call"].sort_values("strike")
+                        puts_smile  = sub_iv[sub_iv["option_type"] == "Put"].sort_values("strike")
+
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=calls_smile["strike"], y=calls_smile["impvol"],
+                            mode="lines+markers", name="Call IV",
+                            line=dict(color="#4285f4", width=2),
+                            marker=dict(size=5)
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=puts_smile["strike"], y=puts_smile["impvol"],
+                            mode="lines+markers", name="Put IV",
+                            line=dict(color="#dc4b4b", width=2),
+                            marker=dict(size=5)
+                        ))
+                        if custom_atm:
+                            fig.add_vline(x=custom_atm, line_dash="dash",
+                                          line_color="#f59e0b", line_width=1.5,
+                                          annotation_text="ATM", annotation_position="top right")
+                        all_iv_vals = pd.concat([calls_smile["impvol"], puts_smile["impvol"]]).dropna()
+                        iv_lo = max(0, all_iv_vals.min() - 3)
+                        iv_hi = all_iv_vals.max() + 3
+                        fig.update_layout(
+                            height=340, margin=dict(l=40, r=20, t=30, b=40),
+                            xaxis_title="Strike", yaxis_title="Implied Vol %",
+                            yaxis=dict(range=[iv_lo, iv_hi]),
+                            legend=dict(orientation="h", y=1.1),
+                            plot_bgcolor="#fafafa", paper_bgcolor="#fafafa"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("No ImpVol data for selected expiry on this date.")
+
+            # ── Row 2b: Term Structure Snapshot ──────────────────────────────
+            with st.expander("Vol Term Structure — ATM IV across expiries (snapshot)", expanded=True):
+                def _ts_snapshot(snap_date, fut_df, custom_atm):
+                    """ATM IV per expiry on one date. Returns sorted DataFrame."""
+                    if "impvol" not in df.columns:
+                        return pd.DataFrame()
+                    sub = df[(df["date"].dt.date == snap_date) & df["impvol"].notna()].copy()
+                    if sub.empty:
+                        return pd.DataFrame()
+                    sub["mk_label"] = (sub["expiry_month"].map(MONTH_NAMES)
+                                       + " '" + sub["expiry_year"].astype(str).str[-2:])
+                    sub["sort_key"] = sub["expiry_year"] * 100 + sub["expiry_month"]
+
+                    if fut_df is not None and not fut_df.empty:
+                        fut_month_ints = sorted(fut_df["month_int"].dropna().unique().tolist())
+                        unique_exp = sub[["expiry_month","expiry_year"]].drop_duplicates()
+                        exp_to_fut = {}
+                        for _, r in unique_exp.iterrows():
+                            em, ey = int(r.expiry_month), int(r.expiry_year)
+                            fm = next((m for m in fut_month_ints if m >= em), fut_month_ints[0])
+                            fy = ey if any(m >= em for m in fut_month_ints) else ey + 1
+                            exp_to_fut[(em, ey)] = (fm, fy)
+                        sub["_fut_m"] = sub.apply(lambda r: exp_to_fut.get(
+                            (int(r.expiry_month), int(r.expiry_year)), (None, None))[0], axis=1)
+                        sub["_fut_y"] = sub.apply(lambda r: exp_to_fut.get(
+                            (int(r.expiry_month), int(r.expiry_year)), (None, None))[1], axis=1)
+                        fut_day = (fut_df[fut_df["Date"].dt.date == snap_date]
+                                   .rename(columns={"month_int": "_fut_m", "year": "_fut_y"}))
+                        sub = sub.merge(fut_day[["_fut_m", "_fut_y", "settlement"]],
+                                        on=["_fut_m", "_fut_y"], how="left")
+                        sub["settlement"] = sub["settlement"].fillna(custom_atm)
+                        sub["atm_dist"] = (sub["strike"] - sub["settlement"]).abs()
+                    else:
+                        sub["atm_dist"] = (sub["strike"] - custom_atm).abs()
+
+                    rows = []
+                    for (lbl, sk), grp in sub.groupby(["mk_label", "sort_key"]):
+                        atm_s = grp.loc[grp["atm_dist"].idxmin(), "strike"]
+                        atm_g = grp[grp["strike"] == atm_s]
+                        iv_c  = atm_g[atm_g["option_type"] == "Call"]["impvol"].mean()
+                        iv_p  = atm_g[atm_g["option_type"] == "Put"]["impvol"].mean()
+                        rows.append({"mk_label": lbl, "sort_key": sk,
+                                     "iv_call": iv_c, "iv_put": iv_p,
+                                     "iv_avg": float(pd.Series([iv_c, iv_p]).mean())})
+                    return pd.DataFrame(rows).sort_values("sort_key").reset_index(drop=True)
+
+                snap_new = _ts_snapshot(new_date, fut_df, custom_atm)
+                snap_old = _ts_snapshot(old_date, fut_df, custom_atm)
+
+                # OI per expiry on new_date
+                oi_snap = (
+                    df[df["date"].dt.date == new_date]
+                    .assign(mk_label=lambda d: d["expiry_month"].map(MONTH_NAMES)
+                                               + " '" + d["expiry_year"].astype(str).str[-2:],
+                            sort_key=lambda d: d["expiry_year"] * 100 + d["expiry_month"])
+                    .groupby(["mk_label", "sort_key"], as_index=False)["oi"]
+                    .sum()
+                    .sort_values("sort_key")
+                )
+
+                if snap_new.empty:
+                    st.info("No ImpVol data available for term structure snapshot.")
+                else:
+                    all_snap_vals = pd.concat([
+                        snap_new[["iv_call","iv_put"]].stack(),
+                        snap_old[["iv_call","iv_put"]].stack() if not snap_old.empty else pd.Series(dtype=float)
+                    ]).dropna()
+                    sn_lo = max(0, float(all_snap_vals.min()) - 2)
+                    sn_hi = float(all_snap_vals.max()) + 2
+
+                    fig_sn = go.Figure()
+
+                    # OI bars on secondary axis — plotted first so IV lines sit on top
+                    if not oi_snap.empty:
+                        fig_sn.add_trace(go.Bar(
+                            x=oi_snap["mk_label"], y=oi_snap["oi"],
+                            name="Total OI", yaxis="y2",
+                            marker_color="rgba(156,163,175,0.35)",
+                            marker_line=dict(color="rgba(156,163,175,0.6)", width=1),
+                            showlegend=True
+                        ))
+
+                    fig_sn.add_trace(go.Scatter(
+                        x=snap_new["mk_label"], y=snap_new["iv_call"],
+                        mode="lines+markers", name=f"Call IV ({new_date})",
+                        line=dict(color="#4285f4", width=2), marker=dict(size=7),
+                        yaxis="y1"
+                    ))
+                    fig_sn.add_trace(go.Scatter(
+                        x=snap_new["mk_label"], y=snap_new["iv_put"],
+                        mode="lines+markers", name=f"Put IV ({new_date})",
+                        line=dict(color="#dc4b4b", width=2), marker=dict(size=7),
+                        yaxis="y1"
+                    ))
+                    if not snap_old.empty:
+                        fig_sn.add_trace(go.Scatter(
+                            x=snap_old["mk_label"], y=snap_old["iv_avg"],
+                            mode="lines+markers", name=f"Avg IV ({old_date})",
+                            line=dict(color="#9ca3af", width=1.5, dash="dash"),
+                            marker=dict(size=5), yaxis="y1"
+                        ))
+
+                    fig_sn.update_layout(
+                        height=380, margin=dict(l=40, r=60, t=30, b=60),
+                        xaxis_title="Expiry",
+                        yaxis=dict(title="Implied Vol %", range=[sn_lo, sn_hi], side="left"),
+                        yaxis2=dict(title="Total OI (lots)", overlaying="y", side="right",
+                                    showgrid=False, rangemode="tozero"),
+                        legend=dict(orientation="h", y=-0.28),
+                        plot_bgcolor="#fafafa", paper_bgcolor="#fafafa",
+                        barmode="overlay"
+                    )
+                    st.plotly_chart(fig_sn, use_container_width=True)
+                    st.caption(
+                        "Call IV and Put IV at ATM strike per expiry (left axis). "
+                        "Grey bars = total OI across all strikes (right axis) — "
+                        "low-OI expiries have unreliable vol readings. "
+                        "Upward slope = contango. Downward = backwardation."
+                    )
+
+            # ── Row 3: ATM Vol Term Structure ─────────────────────────────────
+            with st.expander("ATM Vol Term Structure — ImpVol at ATM across expiries"):
+                all_d_iv = sorted(df[df["impvol"].notna()]["date"].dt.date.unique())
+                if len(all_d_iv) >= 2:
+                    dr_iv = st.slider("Date Range", min_value=all_d_iv[0], max_value=all_d_iv[-1],
+                                      value=(all_d_iv[0], all_d_iv[-1]), key=f"{key_prefix}_iv_dr")
+                    sub_ts = df[
+                        (df["date"].dt.date >= dr_iv[0]) &
+                        (df["date"].dt.date <= dr_iv[1]) &
+                        df["impvol"].notna()
+                    ].copy()
+
+                    # For each date × expiry, find the strike nearest to ATM and take its IV
+                    sub_ts["mk_label"] = (sub_ts["expiry_month"].map(MONTH_NAMES)
+                                          + " '" + sub_ts["expiry_year"].astype(str).str[-2:])
+
+                    # Per-expiry ATM: use each expiry's own futures settlement price.
+                    # Serial months (e.g. KC M/Q) map to the next available futures month.
+                    # Falls back to custom_atm if futures parquet not available.
+                    if fut_df is not None and not fut_df.empty:
+                        fut_month_ints = sorted(fut_df["month_int"].dropna().unique().tolist())
+                        unique_exp = sub_ts[["expiry_month","expiry_year"]].drop_duplicates()
+                        exp_to_fut = {}
+                        for _, r in unique_exp.iterrows():
+                            em, ey = int(r.expiry_month), int(r.expiry_year)
+                            fm = next((m for m in fut_month_ints if m >= em), fut_month_ints[0])
+                            fy = ey if any(m >= em for m in fut_month_ints) else ey + 1
+                            exp_to_fut[(em, ey)] = (fm, fy)
+                        sub_ts["_fut_m"] = sub_ts.apply(
+                            lambda r: exp_to_fut.get((int(r.expiry_month), int(r.expiry_year)), (None, None))[0], axis=1)
+                        sub_ts["_fut_y"] = sub_ts.apply(
+                            lambda r: exp_to_fut.get((int(r.expiry_month), int(r.expiry_year)), (None, None))[1], axis=1)
+                        fut_settle = (fut_df.rename(columns={"Date": "date"})
+                                      .rename(columns={"month_int": "_fut_m", "year": "_fut_y"}))
+                        sub_ts = sub_ts.merge(
+                            fut_settle[["date", "_fut_m", "_fut_y", "settlement"]],
+                            on=["date", "_fut_m", "_fut_y"], how="left"
+                        )
+                        sub_ts["settlement"] = sub_ts["settlement"].fillna(custom_atm)
+                        sub_ts["atm_dist"] = (sub_ts["strike"] - sub_ts["settlement"]).abs()
+                    else:
+                        sub_ts["atm_dist"] = (sub_ts["strike"] - custom_atm).abs()
+
+                    atm_iv_ts = (sub_ts.sort_values("atm_dist")
+                                       .groupby(["date", "mk_label"])
+                                       .first()
+                                       .reset_index()[["date", "mk_label", "impvol"]])
+                    atm_iv_ts["date"] = pd.to_datetime(atm_iv_ts["date"])
+
+                    pivot_ts = atm_iv_ts.pivot(index="date", columns="mk_label", values="impvol")
+                    pivot_ts.columns.name = None
+                    if not pivot_ts.empty:
+                        ts_vals = pivot_ts.values.flatten()
+                        ts_vals = ts_vals[~pd.isna(ts_vals)]
+                        ts_lo   = max(0, float(ts_vals.min()) - 3) if len(ts_vals) else 0
+                        ts_hi   = float(ts_vals.max()) + 3         if len(ts_vals) else 50
+
+                        fig_ts = go.Figure()
+                        colors = ["#4285f4","#dc4b4b","#f59e0b","#34a853","#8b5cf6","#06b6d4","#f97316"]
+                        for i, col in enumerate(pivot_ts.columns):
+                            s = pivot_ts[col].dropna()
+                            fig_ts.add_trace(go.Scatter(
+                                x=s.index, y=s.values,
+                                mode="lines", name=col,
+                                line=dict(color=colors[i % len(colors)], width=1.8)
+                            ))
+                        fig_ts.update_layout(
+                            height=340, margin=dict(l=40, r=20, t=30, b=40),
+                            xaxis_title="Date", yaxis_title="Implied Vol %",
+                            yaxis=dict(range=[ts_lo, ts_hi]),
+                            legend=dict(orientation="h", y=-0.2),
+                            plot_bgcolor="#fafafa", paper_bgcolor="#fafafa"
+                        )
+                        st.plotly_chart(fig_ts, use_container_width=True)
+                        src = "per-expiry futures settlement" if fut_df is not None and not fut_df.empty else "ATM snap (futures unavailable)"
+                        st.caption(f"ATM anchored to {src} for each expiry — serial months mapped to next available futures contract.")
+                else:
+                    st.info("Not enough ImpVol history to plot term structure.")
+
+
+# ── Main layout ────────────────────────────────────────────────────────────────
+st.title("Options Dashboard")
+st.caption(
+    f"Old Date: **{old_date.strftime('%d %b %Y')}**  |  "
+    f"New Date: **{new_date.strftime('%d %b %Y')}**"
+)
+
+tab_kc, tab_cc, tab_sb, tab_ct = st.tabs(["KC — Coffee C", "CC — Cocoa", "SB — Sugar #11", "CT — Cotton"])
+
+atm_kc  = atm_data.get("KC")
+atm_cc  = atm_data.get("CC")
+atm_sb  = atm_data.get("SB")
+atm_ct  = atm_data.get("CT")
+
+fut_kc = load_fut("kc")
+fut_cc = load_fut("cc")
+fut_sb = load_fut("sb")
+fut_ct = load_fut("ct")
+
+with tab_kc:
+    atm_kc_lbl = (f"{int(atm_kc) if atm_kc == int(atm_kc) else atm_kc}"
+                  if atm_kc is not None else "—")
+    render_commodity_tab(
+        df=df_kc, atm_val=atm_kc, atm_label=atm_kc_lbl,
+        old_date=old_date, new_date=new_date,
+        key_prefix="kc", title="KC", ric_fn=_ric_kc,
+        mround_default=50,
+        ingest_note="MRound=50 ¢/lb for ATM snap | Step=2.5 ¢/lb (symbol unit 25)",
+        fut_df=fut_kc,
+    )
+
+with tab_cc:
+    atm_cc_lbl = f"{int(atm_cc):,}" if atm_cc is not None else "—"
+    render_commodity_tab(
+        df=df_cc, atm_val=atm_cc, atm_label=atm_cc_lbl,
+        old_date=old_date, new_date=new_date,
+        key_prefix="cc", title="CC", ric_fn=_ric_cc,
+        display_step=100, mround_default=300,
+        ingest_note="MRound=300 $/mt for ATM snap | Step=5 $/cwt ≈ 110 $/mt in parquet (ICE native)",
+        fut_df=fut_cc,
+    )
+
+with tab_sb:
+    atm_sb_lbl = f"{atm_sb:.2f}" if atm_sb is not None else "—"
+    render_commodity_tab(
+        df=df_sb, atm_val=atm_sb, atm_label=atm_sb_lbl,
+        old_date=old_date, new_date=new_date,
+        key_prefix="sb", title="SB", ric_fn=_ric_sb,
+        mround_default=0.25,
+        ingest_note="MRound=0.25 cts/lb for ATM snap | Step=0.25 cts/lb (symbol unit 25 = 1/100 cts/lb)",
+        fut_df=fut_sb,
+    )
+
+with tab_ct:
+    atm_ct_lbl = f"{int(atm_ct)}" if atm_ct is not None else "—"
+    render_commodity_tab(
+        df=df_ct, atm_val=atm_ct, atm_label=atm_ct_lbl,
+        old_date=old_date, new_date=new_date,
+        key_prefix="ct", title="CT", ric_fn=_ric_ct,
+        mround_default=1,
+        ingest_note="MRound=1 cts/lb for ATM snap | Step=1 cts/lb (integer strikes)",
+        fut_df=fut_ct,
+    )
+
