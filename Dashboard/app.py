@@ -522,7 +522,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                 help=(
                     "Nearest: grid rows at exact step intervals, data pulled from the "
                     "closest parquet strike within Step/2 — clean uniform ladder.\n\n"
-                    "Exact: rows are the actual ICE strikes from the parquet, centered "
+                    "Exact: rows are the actual strikes from the parquet, centered "
                     "on ATM — no interpolation, raw exchange data only."
                 )
             )
