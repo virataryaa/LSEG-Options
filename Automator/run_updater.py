@@ -1,8 +1,9 @@
 """
 run_updater.py — Options (LSEG interim migration) daily automator
-KC only for now — mirrors ICEBREAKER/Options/Automator/run.py's structure
-(same commit/push/email shape) but scoped down while only KC is built.
-Add CC/SB/CT ingest calls here once those are migrated the same way.
+Runs all four commodities (KC/CC/SB/CT) sequentially, mirroring
+ICEBREAKER/Options/Automator/run.py's structure (commit/push/email shape).
+Each commodity's ingest is independent — one failing doesn't stop the rest,
+but any failure marks the whole run as failed for the email subject/exit code.
 """
 
 import subprocess
@@ -13,12 +14,18 @@ from pathlib import Path
 
 import win32com.client
 
-ROOT       = Path(__file__).resolve().parent.parent
-INGEST_KC  = ROOT / "Code" / "kc_ingest_lseg.py"
-PARQUET_KC = ROOT / "Database" / "KC_options_ice.parquet"
-ATM_JSON   = ROOT / "Dashboard" / "atm.json"
-LOG_FILE   = Path(__file__).resolve().parent / "run_log.txt"
-PYTHON     = sys.executable
+ROOT     = Path(__file__).resolve().parent.parent
+CODE_DIR = ROOT / "Code"
+LOG_FILE = Path(__file__).resolve().parent / "run_log.txt"
+PYTHON   = sys.executable
+
+COMMODITIES = {
+    "KC": (CODE_DIR / "kc_ingest_lseg.py", ROOT / "Database" / "KC_options_ice.parquet"),
+    "CC": (CODE_DIR / "cc_ingest_lseg.py", ROOT / "Database" / "CC_options_ice.parquet"),
+    "SB": (CODE_DIR / "sb_ingest_lseg.py", ROOT / "Database" / "SB_options_ice.parquet"),
+    "CT": (CODE_DIR / "ct_ingest_lseg.py", ROOT / "Database" / "CT_options_ice.parquet"),
+}
+ATM_JSON = ROOT / "Dashboard" / "atm.json"
 
 EMAIL_TO = "virat.arya@etgworld.com"
 
@@ -77,27 +84,35 @@ def main():
     log("=" * 50)
     log(f"Options ingest (LSEG) started — {today}")
 
-    ok, out = run_ingest(INGEST_KC, "KC")
-    log(f"KC ingest: {'OK' if ok else 'FAILED'}")
-    for line in out.strip().splitlines():
-        log(f"  {line}")
+    results = {}
+    any_failed = False
+    for label, (script, _parquet) in COMMODITIES.items():
+        ok, out = run_ingest(script, label)
+        results[label] = (ok, out)
+        log(f"{label} ingest: {'OK' if ok else 'FAILED'}")
+        for line in out.strip().splitlines():
+            log(f"  {line}")
+        if not ok:
+            any_failed = True
 
-    if not ok:
-        send_email(f"[Interim_Migration Options] FAILED {today} (KC)", out)
-        sys.exit(1)
-
-    pushed, git_out = git_push([PARQUET_KC, ATM_JSON])
+    files_to_push = [p for _s, p in COMMODITIES.values()] + [ATM_JSON]
+    pushed, git_out = git_push(files_to_push)
     log("Git push: OK" if pushed else "Git push: FAILED (may be nothing new)")
     for line in git_out.strip().splitlines():
         log(f"  {line}")
 
-    body = (
-        f"Options ingest (LSEG) completed — {today}\n\n"
-        f"=== KC ===\n{out.strip()}\n\n"
-        f"Git: {'pushed' if pushed else 'nothing new / failed'}\n{git_out.strip()}"
-    )
-    send_email(f"[Interim_Migration Options] OK {today}", body)
+    body_parts = [f"Options ingest (LSEG) completed — {today}\n"]
+    for label, (ok, out) in results.items():
+        body_parts.append(f"=== {label} ({'OK' if ok else 'FAILED'}) ===\n{out.strip()}\n")
+    body_parts.append(f"Git: {'pushed' if pushed else 'nothing new / failed'}\n{git_out.strip()}")
+    body = "\n".join(body_parts)
+
+    subject = f"[Interim_Migration Options] {'PARTIAL FAIL' if any_failed else 'OK'} {today}"
+    send_email(subject, body)
     log("Done.")
+
+    if any_failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
