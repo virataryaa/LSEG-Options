@@ -999,9 +999,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                     st.plotly_chart(fig_sn, use_container_width=True)
                     st.caption(
                         "Call IV and Put IV at ATM strike per expiry (left axis). "
-                        "Grey bars = total OI across all strikes (right axis) — "
-                        "low-OI expiries have unreliable vol readings. "
-                        "Upward slope = contango. Downward = backwardation."
+                        "Grey bars = total OI across all strikes (right axis)."
                     )
                     anchor_line = "  |  ".join(
                         f"{r.mk_label}: {r.anchor_px:,.2f} (strike {r.anchor_strike}, {r.anchor_src})"
