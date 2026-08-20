@@ -123,7 +123,9 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Latest data available**")
-    for _label, _df in [("KC", df_kc), ("CC", df_cc), ("SB", df_sb), ("CT", df_ct)]:
+    for _label, _df in [("Arabica (KC)", df_kc), ("Robusta (LRC)", df_lrc),
+                        ("NYC Cocoa (CC)", df_cc), ("London Cocoa (LCC)", df_lcc),
+                        ("Sugar (SB)", df_sb), ("Cotton (CT)", df_ct)]:
         if not _df.empty:
             _latest = _df["date"].max().date().strftime("%d %b %Y")
             st.caption(f"{_label} — {_latest}")
@@ -1094,9 +1096,8 @@ st.caption(
     f"New Date: **{new_date.strftime('%d %b %Y')}**"
 )
 
-tab_kc, tab_cc, tab_sb, tab_ct, tab_lrc, tab_lcc = st.tabs(
-    ["KC — Coffee C", "CC — Cocoa", "SB — Sugar #11", "CT — Cotton",
-     "LRC — Robusta Coffee", "LCC — London Cocoa"]
+tab_kc, tab_lrc, tab_cc, tab_lcc, tab_sb, tab_ct = st.tabs(
+    ["Arabica", "Robusta", "NYC Cocoa", "London Cocoa", "Sugar (SB)", "Cotton"]
 )
 
 atm_kc  = atm_data.get("KC")
@@ -1125,6 +1126,18 @@ with tab_kc:
         fut_df=fut_kc,
     )
 
+with tab_lrc:
+    atm_lrc_lbl = f"{int(atm_lrc):,}" if atm_lrc is not None else "—"
+    render_commodity_tab(
+        df=df_lrc, atm_val=atm_lrc, atm_label=atm_lrc_lbl,
+        old_date=old_date, new_date=new_date,
+        key_prefix="lrc", title="LRC", ric_fn=_ric_lrc,
+        display_step=25, mround_default=25,
+        ingest_note="MRound=25 $/tonne for ATM snap | Step=25 $/tonne | "
+                     "active months Jan/Mar/May/Jul/Sep/Nov only (confirmed live vs LSEG)",
+        fut_df=fut_lrc,
+    )
+
 with tab_cc:
     atm_cc_lbl = f"{int(atm_cc):,}" if atm_cc is not None else "—"
     render_commodity_tab(
@@ -1134,6 +1147,18 @@ with tab_cc:
         display_step=50, mround_default=300,
         ingest_note="MRound=300 $/mt for ATM snap | Step=50 $/mt (cc_ingest_lseg.py STRIKE_GAP)",
         fut_df=fut_cc,
+    )
+
+with tab_lcc:
+    atm_lcc_lbl = f"{int(atm_lcc):,}" if atm_lcc is not None else "—"
+    render_commodity_tab(
+        df=df_lcc, atm_val=atm_lcc, atm_label=atm_lcc_lbl,
+        old_date=old_date, new_date=new_date,
+        key_prefix="lcc", title="LCC", ric_fn=_ric_lcc,
+        display_step=25, mround_default=25,
+        ingest_note="MRound=25 for ATM snap | Step=25 | "
+                     "active months Mar/May/Jul/Sep/Dec only (confirmed live vs LSEG)",
+        fut_df=fut_lcc,
     )
 
 with tab_sb:
@@ -1156,29 +1181,5 @@ with tab_ct:
         display_step=1, mround_default=1,
         ingest_note="MRound=1 cts/lb for ATM snap | Step=1 cts/lb (ct_ingest_lseg.py STRIKE_GAP)",
         fut_df=fut_ct,
-    )
-
-with tab_lrc:
-    atm_lrc_lbl = f"{int(atm_lrc):,}" if atm_lrc is not None else "—"
-    render_commodity_tab(
-        df=df_lrc, atm_val=atm_lrc, atm_label=atm_lrc_lbl,
-        old_date=old_date, new_date=new_date,
-        key_prefix="lrc", title="LRC", ric_fn=_ric_lrc,
-        display_step=25, mround_default=25,
-        ingest_note="MRound=25 $/tonne for ATM snap | Step=25 $/tonne | "
-                     "active months Jan/Mar/May/Jul/Sep/Nov only (confirmed live vs LSEG)",
-        fut_df=fut_lrc,
-    )
-
-with tab_lcc:
-    atm_lcc_lbl = f"{int(atm_lcc):,}" if atm_lcc is not None else "—"
-    render_commodity_tab(
-        df=df_lcc, atm_val=atm_lcc, atm_label=atm_lcc_lbl,
-        old_date=old_date, new_date=new_date,
-        key_prefix="lcc", title="LCC", ric_fn=_ric_lcc,
-        display_step=25, mround_default=25,
-        ingest_note="MRound=25 for ATM snap | Step=25 | "
-                     "active months Mar/May/Jul/Sep/Dec only (confirmed live vs LSEG)",
-        fut_df=fut_lcc,
     )
 
