@@ -906,16 +906,31 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
 
                     has_futures = fut_df is not None and not fut_df.empty
                     rows = []
+                    # Call and Put each pick their OWN nearest-to-anchor strike with a
+                    # live impvol reading, instead of being forced onto one shared
+                    # "ATM strike" — a thin expiry often has calls quoted near ATM but
+                    # no put trading at that exact strike (or vice versa), and forcing
+                    # both onto the same strike created a gap even when a put existed
+                    # just one strike away. This doesn't fix a genuinely one-sided
+                    # expiry (no puts at all that day) — nothing can — but it recovers
+                    # the cases where the other side just wasn't at the identical strike.
                     for (lbl, sk), grp in sub.groupby(["mk_label", "sort_key"]):
-                        atm_s  = grp.loc[grp["atm_dist"].idxmin(), "strike"]
                         anchor = float(grp["settlement"].iloc[0])  # same for the whole expiry group
-                        atm_g = grp[grp["strike"] == atm_s]
-                        iv_c  = atm_g[atm_g["option_type"] == "Call"]["impvol"].mean()
-                        iv_p  = atm_g[atm_g["option_type"] == "Put"]["impvol"].mean()
+                        calls = grp[(grp["option_type"] == "Call") & grp["impvol"].notna()]
+                        puts  = grp[(grp["option_type"] == "Put")  & grp["impvol"].notna()]
+                        iv_c = iv_p = np.nan
+                        strike_c = strike_p = None
+                        if not calls.empty:
+                            i = calls["atm_dist"].idxmin()
+                            iv_c, strike_c = calls.at[i, "impvol"], calls.at[i, "strike"]
+                        if not puts.empty:
+                            i = puts["atm_dist"].idxmin()
+                            iv_p, strike_p = puts.at[i, "impvol"], puts.at[i, "strike"]
                         rows.append({"mk_label": lbl, "sort_key": sk,
                                      "iv_call": iv_c, "iv_put": iv_p,
                                      "iv_avg": float(pd.Series([iv_c, iv_p]).mean()),
-                                     "anchor_px": anchor, "anchor_strike": atm_s,
+                                     "anchor_px": anchor,
+                                     "call_strike": strike_c, "put_strike": strike_p,
                                      "anchor_src": "Futures settlement" if has_futures else "ATM snap"})
                     return pd.DataFrame(rows).sort_values("sort_key").reset_index(drop=True)
 
@@ -958,25 +973,29 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                             showlegend=True
                         ))
 
-                    anchor_hover = (
+                    call_hover = (
                         "<b>%{x}</b><br>Call IV: %{y:.1f}%<br>"
-                        "Anchor: %{customdata[0]:,.2f} (strike %{customdata[1]}, %{customdata[2]})<extra></extra>"
+                        "Anchor: %{customdata[0]:,.2f} (call strike %{customdata[1]}, %{customdata[2]})<extra></extra>"
+                    )
+                    put_hover = (
+                        "<b>%{x}</b><br>Put IV: %{y:.1f}%<br>"
+                        "Anchor: %{customdata[0]:,.2f} (put strike %{customdata[1]}, %{customdata[2]})<extra></extra>"
                     )
                     fig_sn.add_trace(go.Scatter(
                         x=snap_new["mk_label"], y=snap_new["iv_call"],
                         mode="lines+markers", name=f"Call IV ({new_date})",
                         line=dict(color="#4285f4", width=2), marker=dict(size=7),
                         yaxis="y1",
-                        customdata=snap_new[["anchor_px", "anchor_strike", "anchor_src"]].values,
-                        hovertemplate=anchor_hover,
+                        customdata=snap_new[["anchor_px", "call_strike", "anchor_src"]].values,
+                        hovertemplate=call_hover,
                     ))
                     fig_sn.add_trace(go.Scatter(
                         x=snap_new["mk_label"], y=snap_new["iv_put"],
                         mode="lines+markers", name=f"Put IV ({new_date})",
                         line=dict(color="#dc4b4b", width=2), marker=dict(size=7),
                         yaxis="y1",
-                        customdata=snap_new[["anchor_px", "anchor_strike", "anchor_src"]].values,
-                        hovertemplate=anchor_hover.replace("Call IV", "Put IV"),
+                        customdata=snap_new[["anchor_px", "put_strike", "anchor_src"]].values,
+                        hovertemplate=put_hover,
                     ))
                     if not snap_old.empty:
                         fig_sn.add_trace(go.Scatter(
@@ -998,11 +1017,17 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                     )
                     st.plotly_chart(fig_sn, use_container_width=True)
                     st.caption(
-                        "Call IV and Put IV at ATM strike per expiry (left axis). "
+                        "Call IV and Put IV each use the nearest strike to the anchor "
+                        "price that actually has a live reading — the two can differ "
+                        "if one side isn't trading at the exact ATM strike (left axis). "
                         "Grey bars = total OI across all strikes (right axis)."
                     )
+                    def _fmt_strike(r, side):
+                        v = r.call_strike if side == "C" else r.put_strike
+                        return f"{v:g}" if v is not None and not pd.isna(v) else "—"
                     anchor_line = "  |  ".join(
-                        f"{r.mk_label}: {r.anchor_px:,.2f} (strike {r.anchor_strike}, {r.anchor_src})"
+                        f"{r.mk_label}: {r.anchor_px:,.2f} "
+                        f"(call {_fmt_strike(r,'C')} / put {_fmt_strike(r,'P')}, {r.anchor_src})"
                         for r in snap_new.itertuples()
                     )
                     st.caption(f"**Live price used per expiry ({new_date}):** {anchor_line}")
