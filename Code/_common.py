@@ -44,12 +44,15 @@ def make_logger(name: str, log_dir: Path):
     return logger
 
 
-def get_atm_strike(ld, atm_ric: str, strike_gap: float) -> float:
+def get_atm_strike(ld, atm_ric: str, strike_gap: float, atm_field: str = "TRDPRC_1") -> float:
     """Fetch front-month price and snap to nearest strike_gap increment.
     Stays in real price units throughout (e.g. 362.5 cts/lb, 5900 $/mt) —
-    the RIC-encoding multiplier is applied only in build_ric, not here."""
-    df = ld.get_data(universe=[atm_ric], fields=["TRDPRC_1"])
-    price = float(df["TRDPRC_1"].iloc[0])
+    the RIC-encoding multiplier is applied only in build_ric, not here.
+    atm_field defaults to TRDPRC_1 (last trade) to match the already-proven
+    KC/CC/SB/CT scripts unchanged; SETTLE is used for LRC/LCC since
+    TRDPRC_1 was observed null off-hours while SETTLE is always populated."""
+    df = ld.get_data(universe=[atm_ric], fields=[atm_field])
+    price = float(df[atm_field].iloc[0])
     return round(round(price / strike_gap) * strike_gap, 2)
 
 
@@ -57,28 +60,34 @@ def build_strikes(atm: float, strike_gap: float, strike_steps: int) -> list:
     return [round(atm + i * strike_gap, 2) for i in range(-strike_steps, strike_steps + 1)]
 
 
-def build_months(months_forward: int) -> list:
+def build_months(months_forward: int, allowed_months: set = None) -> list:
+    """Next `months_forward` listed expiries from today. allowed_months restricts
+    to a subset of calendar months (e.g. LRC trades Jan/Mar/May/Jul/Sep/Nov only,
+    LCC trades Mar/May/Jul/Sep/Dec only) — confirmed empirically per-commodity,
+    not a general assumption. Without it, every calendar month is listed (KC/CC/SB/CT)."""
     months, m, y = [], today.month, today.year
-    for _ in range(months_forward):
-        months.append((m, y))
+    while len(months) < months_forward:
+        if allowed_months is None or m in allowed_months:
+            months.append((m, y))
         m += 1
         if m > 12:
             m, y = 1, y + 1
     return months
 
 
-def build_ric(commodity: str, strike: float, month: int, year: int, option_type: str, multiplier: int) -> str:
+def build_ric(commodity: str, strike: float, month: int, year: int, option_type: str,
+              multiplier: int, prefix: str = "1") -> str:
     code = CALL_CODES[month] if option_type == "Call" else PUT_CODES[month]
-    return f"1{commodity}{int(round(strike * multiplier))}{code}{str(year)[-2:]}"
+    return f"{prefix}{commodity}{int(round(strike * multiplier))}{code}{str(year)[-2:]}"
 
 
-def build_meta(commodity: str, strikes: list, months: list, multiplier: int) -> pd.DataFrame:
+def build_meta(commodity: str, strikes: list, months: list, multiplier: int, prefix: str = "1") -> pd.DataFrame:
     rows = []
     for strike in strikes:
         for (m, y) in months:
             for otype in ("Call", "Put"):
                 rows.append({
-                    "ric": build_ric(commodity, strike, m, y, otype, multiplier),
+                    "ric": build_ric(commodity, strike, m, y, otype, multiplier, prefix),
                     "option_type": otype,
                     "strike": strike,
                     "expiry_month": m,
@@ -144,8 +153,14 @@ def fetch_batch(ld, rics: list, start: str, end: str, log) -> pd.DataFrame:
 def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: int,
                 strike_multiplier: int, months_forward: int, backfill_days: int,
                 rolling_days: int, batch_size: int,
-                parquet_path: Path, atm_json: Path, log, force_full: bool = False):
-    """Shared main-loop body. Returns the final DataFrame written to parquet."""
+                parquet_path: Path, atm_json: Path, log, force_full: bool = False,
+                ric_prefix: str = "1", allowed_months: set = None, atm_field: str = "TRDPRC_1"):
+    """Shared main-loop body. Returns the final DataFrame written to parquet.
+    ric_prefix: '1' for KC/CC/SB/CT-style RICs, '' for LRC/LCC (root is already
+    unambiguous, no disambiguator prefix — confirmed live via discovery.search).
+    allowed_months: restricts to a commodity's actual listed contract months
+    (e.g. LRC = Jan/Mar/May/Jul/Sep/Nov, LCC = Mar/May/Jul/Sep/Dec) instead of
+    every calendar month — also confirmed live, not assumed."""
     import lseg.data as ld
     ld.open_session()
     log.info("%s Options Ingest (LSEG) | %s", commodity, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -157,10 +172,10 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
         fetch_end   = today.strftime("%Y-%m-%d")
         log.info("Mode: %s | window: %s -> %s", "FULL" if first_run else "INCREMENTAL", fetch_start, fetch_end)
 
-        atm     = get_atm_strike(ld, atm_ric, strike_gap)
+        atm     = get_atm_strike(ld, atm_ric, strike_gap, atm_field)
         strikes = build_strikes(atm, strike_gap, strike_steps)
-        months  = build_months(months_forward)
-        meta    = build_meta(commodity, strikes, months, strike_multiplier)
+        months  = build_months(months_forward, allowed_months)
+        meta    = build_meta(commodity, strikes, months, strike_multiplier, ric_prefix)
         all_rics = meta["ric"].tolist()
 
         month_labels = ", ".join(f"{MONTH_NAMES[m]} {y}" for m, y in months)

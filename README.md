@@ -4,17 +4,21 @@ Interim replacement for `ICEBREAKER/Options`, rebuilt against the **LSEG
 Data API** (`lseg.data`) instead of ICE Connect (`icepython`), for the
 period while ICE API access is unavailable.
 
-## Scope — all four commodities now built
+## Scope — six commodities now built
 
 Per direct instruction, this migration was built **one commodity at a
-time**: KC first, confirmed solid, then CC/SB/CT built the same way once KC
-was validated. All four are now live. The Dashboard (copied verbatim from
-the ICE source) handled the KC-only interim period gracefully — each
-commodity's parquet load is wrapped in `_try_load()`, showing an
-`st.warning()` and falling back to an empty frame instead of crashing when
-a file doesn't exist — and with all four parquets now present, those
-warnings no longer appear. LCC was never integrated into the ICE source
-either (orphaned) and remains out of scope here too, unless asked for later.
+time**: KC first, confirmed solid, then CC/SB/CT, then LRC (Robusta) and
+LCC (London Cocoa) once the pattern was proven. All six are now live. The
+Dashboard's `_try_load()` wrapper (each commodity's parquet load wrapped in
+try/except, `st.warning()` + empty frame on failure) made every incremental
+rollout safe — no commodity going missing ever crashed the app, it just
+showed a warning for that tab until built.
+
+LRC and LCC had essentially **no prior art to build from**: ICE's own
+`Options/Code/LCC_Ingest.py` exists but was never run (no parquet, no
+Dashboard tab — genuinely orphaned), and there was never an LRC or LSU
+script at all. Both were built entirely from live LSEG discovery, same
+rigor as CC/SB/CT — see below. LSU (White Sugar) is still not built.
 
 ## Where the RIC scheme came from
 
@@ -54,15 +58,46 @@ scheme, strike units and grid step were each discovered from scratch via
   `KCc2` (2nd nearby) instead — deliberately not carried over, since ICE's
   own convention is the more faithful match and the prototype was
   known-unfinished.
-- **Strike/month universe:** 12 forward months for all four. Strike wings
-  differ per commodity's own tick size and typical range — matched to (KC/
-  SB/CT) or scaled from (CC) the ICE source's own wing choices:
-  | Commodity | Strike gap | Wing (±strikes) | Encoding |
-  |---|---|---|---|
-  | KC | 2.5 cts/lb | 20 | ×100 |
-  | CC | 50 $/mt | 40 | ×1 |
-  | SB | 0.25 cts/lb | 20 | ×100 |
-  | CT | 1 ct/lb | 20 | ×100 |
+- **Strike/month universe:** 12 forward months for KC/CC/SB/CT. LRC and LCC
+  are different — both trade on **restricted contract-month cycles**, not
+  every calendar month:
+  | Commodity | Strike gap | Wing (±strikes) | Encoding | RIC prefix | Active months |
+  |---|---|---|---|---|---|
+  | KC | 2.5 cts/lb | 20 | ×100 | `1` | all 12 |
+  | CC | 50 $/mt | 40 | ×1 | `1` | all 12 |
+  | SB | 0.25 cts/lb | 20 | ×100 | `1` | all 12 |
+  | CT | 1 ct/lb | 20 | ×100 | `1` | all 12 |
+  | LRC | 25 $/tonne | 30 | ×1 | *(none)* | Jan/Mar/May/Jul/Sep/Nov |
+  | LCC | 25 | 40 | ×1 | *(none)* | Mar/May/Jul/Sep/Dec |
+
+  LRC/LCC's month restriction was **confirmed empirically, not assumed**:
+  tested all 12 month codes live against `get_data`, cross-checked against a
+  known-fake RIC to make sure the API actually errors on invalid instruments
+  rather than silently returning null for both valid-but-quiet and
+  genuinely-nonexistent ones. Even months for LRC and non-Mar/May/Jul/Sep/Dec
+  months for LCC genuinely error ("record could not be found"); the rest
+  resolve cleanly. LCC's 5-month cycle independently matches ICE's own
+  (never-run) `LCC_Ingest.py` comment about the real-world contract months —
+  useful confirmation that the underlying market fact is right, even though
+  that script's own symbol format (`£/tonne × 10`, ICE's legacy feed
+  convention) doesn't apply to LSEG's RICs at all.
+
+  LRC and LCC also **skip the `1` RIC prefix** that KC/CC/SB/CT use — `LRC`
+  and `LCC` are already unambiguous 3-letter roots, so LSEG doesn't need a
+  disambiguator (confirmed via `discovery.search`: real listed titles like
+  "ICE Robusta Coffee Commodity Option 3700 Call Sep 2026" resolve as bare
+  `LRC3700I26`, not `1LRC...`). `Code/_common.py`'s `build_ric`/`build_meta`
+  now take a `prefix` parameter for this (defaults to `"1"`, so KC/CC/SB/CT
+  are unaffected).
+
+  One more difference: LRC/LCC's ATM reference uses the `SETTLE` field
+  instead of `TRDPRC_1` (last trade). `TRDPRC_1` was observed null
+  off-hours for `LRCc1`/`LCCc1` — and, in the same check, for `KCc1`/`CCc1`
+  too, at the same moment, confirming it's a market-hours snapshot artifact
+  rather than an LRC/LCC-specific problem. `SETTLE` is always populated, so
+  it's what these two use; KC/CC/SB/CT are left on `TRDPRC_1` unchanged
+  since that's already proven in production. `_common.get_atm_strike` now
+  takes an `atm_field` parameter for this.
 - **Fields:** `SETTLE`, `OPINT_1` (open interest), `ACVOL_UNS` (volume),
   `IMP_VOLT` (implied volatility) — same four fields resolve cleanly for
   all four commodities. IV was never pulled by the old KC prototype;
@@ -112,7 +147,7 @@ first.
   the last `ROLLING_DAYS` (10) are re-fetched and merged/deduped against
   the existing parquet. Each also maintains its own key in the shared
   `Dashboard/atm.json`.
-- **`Database/{KC,CC,SB,CT}_options_ice.parquet`** — first full backfills:
+- **`Database/{KC,CC,SB,CT,LRC,LCC}_options_ice.parquet`** — first full backfills:
 
   | Commodity | Rows | Date range | Live RICs | Calls / Puts | impvol coverage |
   |---|---|---|---|---|---|
@@ -120,6 +155,8 @@ first.
   | CC | 14,920 | 2026-05-21 → 2026-08-18 | 286 | 172 / 114 | 97.1% |
   | SB | 22,875 | 2026-05-21 → 2026-08-18 | 417 | 225 / 192 | 95.6% |
   | CT | 22,265 | 2026-05-21 → 2026-08-18 | 365 | 217 / 148 | 97.6% |
+  | LRC | 8,719 | 2026-05-22 → 2026-08-19 | 140 | 74 / 66 | 95.2% |
+  | LCC | 10,917 | 2026-05-22 → 2026-08-19 | 175 | 111 / 64 | 98.1% |
 
 - **`Dashboard/app.py`**, **`requirements.txt`** — copied verbatim from
   `ICEBREAKER/Options/Dashboard`, no code changes. Verified via Streamlit
@@ -164,6 +201,29 @@ for KC, one fully-populated RIC's daily series:
   (0.01) — a classic implied-vol solver artifact at the price floor, not
   a data error. Confirmed by inspecting the actual rows: both had
   `settle == 0.01`, low/no OI, near-term expiry.
+- LRC: settle 0.00 – 1,316.00 ($/tonne), strikes 3,000 – 4,475, bracketing
+  the LRCc1 ATM of 3,725. Same deep-ITM IV instability seen on the high end
+  (391% max) — traced to a strike far ITM (3,000 vs ATM 3,725) where low
+  vega makes the IV solver numerically unstable on small settle moves, not
+  a data error.
+- LCC: settle 1.00 – 2,063.00, strikes 3,300 – 5,250, bracketing the LCCc1
+  ATM of 4,275. impvol stayed in a tight, plausible 34%–90% band — no
+  outliers to explain.
+- **RIC-builder parity check** (same method used for the Dashboard drill-down
+  bug fix): reconstructed every unique (strike, expiry, type) combination
+  actually present in the LRC/LCC data and confirmed **100% match** against
+  the real `ric` values (140 and 175 contracts respectively) before wiring
+  `_ric_lrc`/`_ric_lcc` into the Dashboard.
+
+## Dashboard notes
+
+- The "ATM Time Series — Implied from Put-Call Parity" panel (under OI
+  Change + Volume) was removed per direct instruction — it added a
+  put-call-parity-derived strike-tracking chart that wasn't earning its
+  space; `get_atm_ts()` was deleted too since nothing else called it.
+- The "Vol Surface" inner tab is labeled "Vol Surface (Proof of Concept)"
+  per direct instruction, to flag that its term-structure/smile panels are
+  exploratory rather than a finished, production-grade vol surface.
 
 ## Running it
 
@@ -172,6 +232,8 @@ python Code/kc_ingest_lseg.py           # incremental (last 10 days)
 python Code/cc_ingest_lseg.py --full    # full rebuild, 90-day backfill
 python Code/sb_ingest_lseg.py
 python Code/ct_ingest_lseg.py
+python Code/lrc_ingest_lseg.py
+python Code/lcc_ingest_lseg.py
 streamlit run Dashboard/app.py
 ```
 
@@ -180,6 +242,8 @@ the ingest scripts.
 
 ## Next steps
 
+- LSU (White Sugar) is the one remaining ICE-Europe commodity not yet
+  built — same empirical-discovery approach as LRC/LCC.
 - Deployed to GitHub (`virataryaa/interim-migration-Options`). Streamlit
   Cloud deploy + homepage (`icebreaker.html`) link, once a URL is available.
 - Task Scheduler (cmd.exe basic task calling `run.bat`, "run only when

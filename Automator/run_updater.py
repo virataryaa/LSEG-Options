@@ -20,10 +20,12 @@ LOG_FILE = Path(__file__).resolve().parent / "run_log.txt"
 PYTHON   = sys.executable
 
 COMMODITIES = {
-    "KC": (CODE_DIR / "kc_ingest_lseg.py", ROOT / "Database" / "KC_options_ice.parquet"),
-    "CC": (CODE_DIR / "cc_ingest_lseg.py", ROOT / "Database" / "CC_options_ice.parquet"),
-    "SB": (CODE_DIR / "sb_ingest_lseg.py", ROOT / "Database" / "SB_options_ice.parquet"),
-    "CT": (CODE_DIR / "ct_ingest_lseg.py", ROOT / "Database" / "CT_options_ice.parquet"),
+    "KC":  (CODE_DIR / "kc_ingest_lseg.py",  ROOT / "Database" / "KC_options_ice.parquet"),
+    "CC":  (CODE_DIR / "cc_ingest_lseg.py",  ROOT / "Database" / "CC_options_ice.parquet"),
+    "SB":  (CODE_DIR / "sb_ingest_lseg.py",  ROOT / "Database" / "SB_options_ice.parquet"),
+    "CT":  (CODE_DIR / "ct_ingest_lseg.py",  ROOT / "Database" / "CT_options_ice.parquet"),
+    "LRC": (CODE_DIR / "lrc_ingest_lseg.py", ROOT / "Database" / "LRC_options_ice.parquet"),
+    "LCC": (CODE_DIR / "lcc_ingest_lseg.py", ROOT / "Database" / "LCC_options_ice.parquet"),
 }
 ATM_JSON = ROOT / "Dashboard" / "atm.json"
 

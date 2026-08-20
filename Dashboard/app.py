@@ -55,6 +55,18 @@ def load_ct():
     return df
 
 @st.cache_data(ttl=1800)
+def load_lrc():
+    df = pd.read_parquet(DB_PATH / "LRC_options_ice.parquet")
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+@st.cache_data(ttl=1800)
+def load_lcc():
+    df = pd.read_parquet(DB_PATH / "LCC_options_ice.parquet")
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+@st.cache_data(ttl=1800)
 def load_fut(name: str) -> pd.DataFrame:
     """Load futures parquet for per-expiry ATM. Returns empty DF if unavailable (e.g. Streamlit Cloud)."""
     path = FUT_PATH / f"{name}_futures.parquet"
@@ -85,6 +97,8 @@ df_kc    = _try_load(load_kc,  "KC")
 df_cc    = _try_load(load_cc,  "CC")
 df_sb    = _try_load(load_sb,  "SB")
 df_ct    = _try_load(load_ct,  "CT")
+df_lrc   = _try_load(load_lrc, "LRC")
+df_lcc   = _try_load(load_lcc, "LCC")
 atm_data = load_atm()
 
 all_dates = set()
@@ -430,30 +444,18 @@ def _ric_ct(strike, month, year, opt):
     yy   = f"{year % 100:02d}"
     return f"1CT{int(round(strike * 100))}{code}{yy}"
 
+def _ric_lrc(strike, month, year, opt):
+    """LRC (Robusta) — no leading '1' (already an unambiguous root),
+    raw $/tonne strikes, no *100 encoding."""
+    code = CALL_CODES[month] if opt == "Call" else PUT_CODES[month]
+    yy   = f"{year % 100:02d}"
+    return f"LRC{int(round(strike))}{code}{yy}"
 
-# ── ATM time series (put-call parity) ─────────────────────────────────────────
-def get_atm_ts(df: pd.DataFrame) -> pd.DataFrame:
-    """For each date × expiry, find the strike where |call_settle - put_settle| is
-    minimised (put-call parity ⟹ that strike = underlying price).  Returns a
-    DataFrame with columns [date, expiry, atm_strike]."""
-    calls = (df[df["option_type"] == "Call"]
-             [["date", "expiry_month", "expiry_year", "strike", "settle"]]
-             .dropna(subset=["settle"]))
-    puts  = (df[df["option_type"] == "Put"]
-             [["date", "expiry_month", "expiry_year", "strike", "settle"]]
-             .dropna(subset=["settle"]))
-    merged = calls.merge(puts,
-                         on=["date", "expiry_month", "expiry_year", "strike"],
-                         suffixes=("_c", "_p"))
-    if merged.empty:
-        return pd.DataFrame(columns=["date", "expiry", "atm_strike"])
-    merged["diff"] = (merged["settle_c"] - merged["settle_p"]).abs()
-    idx = merged.groupby(["date", "expiry_month", "expiry_year"])["diff"].idxmin()
-    best = merged.loc[idx].copy()
-    best["expiry"]     = (best["expiry_month"].map(MONTH_NAMES)
-                          + " '" + best["expiry_year"].astype(str).str[-2:])
-    best["atm_strike"] = best["strike"]
-    return best[["date", "expiry", "atm_strike"]].sort_values("date")
+def _ric_lcc(strike, month, year, opt):
+    """LCC (London Cocoa) — no leading '1', raw strike scale, no *100 encoding."""
+    code = CALL_CODES[month] if opt == "Call" else PUT_CODES[month]
+    yy   = f"{year % 100:02d}"
+    return f"LCC{int(round(strike))}{code}{yy}"
 
 
 # ── Commodity tab renderer ─────────────────────────────────────────────────────
@@ -516,7 +518,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
             )
         with col_mode:
             strike_mode = st.radio(
-                "Strike mode", ["Nearest", "Exact"],
+                "Strike mode", ["Exact", "Nearest"],
                 index=0, horizontal=True,
                 key=f"{key_prefix}_strike_mode",
                 help=(
@@ -584,7 +586,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     )
 
     has_iv = "impvol" in df.columns and df["impvol"].notna().any()
-    tab_labels = ["OI Change + Volume", "Px Change"] + (["Vol Surface"] if has_iv else [])
+    tab_labels = ["OI Change + Volume", "Px Change"] + (["Vol Surface (Proof of Concept)"] if has_iv else [])
     inner_tabs  = st.tabs(tab_labels)
     inner1, inner2 = inner_tabs[0], inner_tabs[1]
     inner3 = inner_tabs[2] if has_iv else None
@@ -755,26 +757,6 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                     vol_w.columns.name = None
                     st.line_chart(vol_w.rename(columns={"Call": "Call Vol", "Put": "Put Vol"}))
 
-        with st.expander("ATM Time Series — Implied from Put-Call Parity"):
-            atm_ts = get_atm_ts(df)
-            if atm_ts.empty:
-                st.info("Not enough paired call/put data to compute ATM time series.")
-            else:
-                expiries_avail = sorted(atm_ts["expiry"].unique())
-                sel_expiries = st.multiselect(
-                    "Expiries to show", expiries_avail,
-                    default=expiries_avail[:3],
-                    key=f"{key_prefix}_atm_ts_exp"
-                )
-                plot_df = (atm_ts[atm_ts["expiry"].isin(sel_expiries)]
-                           .pivot(index="date", columns="expiry", values="atm_strike"))
-                plot_df.columns.name = None
-                if not plot_df.empty:
-                    st.line_chart(plot_df)
-                    st.caption(
-                        "Strike where |call settle − put settle| is smallest on each date — "
-                        "tracks the underlying futures price via put-call parity."
-                    )
 
     with inner2:
         call_px  = get_px_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
@@ -1084,17 +1066,24 @@ st.caption(
     f"New Date: **{new_date.strftime('%d %b %Y')}**"
 )
 
-tab_kc, tab_cc, tab_sb, tab_ct = st.tabs(["KC — Coffee C", "CC — Cocoa", "SB — Sugar #11", "CT — Cotton"])
+tab_kc, tab_cc, tab_sb, tab_ct, tab_lrc, tab_lcc = st.tabs(
+    ["KC — Coffee C", "CC — Cocoa", "SB — Sugar #11", "CT — Cotton",
+     "LRC — Robusta Coffee", "LCC — London Cocoa"]
+)
 
 atm_kc  = atm_data.get("KC")
 atm_cc  = atm_data.get("CC")
 atm_sb  = atm_data.get("SB")
 atm_ct  = atm_data.get("CT")
+atm_lrc = atm_data.get("LRC")
+atm_lcc = atm_data.get("LCC")
 
-fut_kc = load_fut("kc")
-fut_cc = load_fut("cc")
-fut_sb = load_fut("sb")
-fut_ct = load_fut("ct")
+fut_kc  = load_fut("kc")
+fut_cc  = load_fut("cc")
+fut_sb  = load_fut("sb")
+fut_ct  = load_fut("ct")
+fut_lrc = load_fut("lrc")
+fut_lcc = load_fut("lcc")
 
 with tab_kc:
     atm_kc_lbl = (f"{int(atm_kc) if atm_kc == int(atm_kc) else atm_kc}"
@@ -1103,8 +1092,8 @@ with tab_kc:
         df=df_kc, atm_val=atm_kc, atm_label=atm_kc_lbl,
         old_date=old_date, new_date=new_date,
         key_prefix="kc", title="KC", ric_fn=_ric_kc,
-        mround_default=50,
-        ingest_note="MRound=50 ¢/lb for ATM snap | Step=2.5 ¢/lb (symbol unit 25)",
+        display_step=2.5, mround_default=50,
+        ingest_note="MRound=50 ¢/lb for ATM snap | Step=2.5 ¢/lb (kc_ingest_lseg.py STRIKE_GAP)",
         fut_df=fut_kc,
     )
 
@@ -1114,8 +1103,8 @@ with tab_cc:
         df=df_cc, atm_val=atm_cc, atm_label=atm_cc_lbl,
         old_date=old_date, new_date=new_date,
         key_prefix="cc", title="CC", ric_fn=_ric_cc,
-        display_step=100, mround_default=300,
-        ingest_note="MRound=300 $/mt for ATM snap | Step=5 $/cwt ≈ 110 $/mt in parquet (ICE native)",
+        display_step=50, mround_default=300,
+        ingest_note="MRound=300 $/mt for ATM snap | Step=50 $/mt (cc_ingest_lseg.py STRIKE_GAP)",
         fut_df=fut_cc,
     )
 
@@ -1125,8 +1114,8 @@ with tab_sb:
         df=df_sb, atm_val=atm_sb, atm_label=atm_sb_lbl,
         old_date=old_date, new_date=new_date,
         key_prefix="sb", title="SB", ric_fn=_ric_sb,
-        mround_default=0.25,
-        ingest_note="MRound=0.25 cts/lb for ATM snap | Step=0.25 cts/lb (symbol unit 25 = 1/100 cts/lb)",
+        display_step=0.25, mround_default=0.25,
+        ingest_note="MRound=0.25 cts/lb for ATM snap | Step=0.25 cts/lb (sb_ingest_lseg.py STRIKE_GAP)",
         fut_df=fut_sb,
     )
 
@@ -1136,8 +1125,32 @@ with tab_ct:
         df=df_ct, atm_val=atm_ct, atm_label=atm_ct_lbl,
         old_date=old_date, new_date=new_date,
         key_prefix="ct", title="CT", ric_fn=_ric_ct,
-        mround_default=1,
-        ingest_note="MRound=1 cts/lb for ATM snap | Step=1 cts/lb (integer strikes)",
+        display_step=1, mround_default=1,
+        ingest_note="MRound=1 cts/lb for ATM snap | Step=1 cts/lb (ct_ingest_lseg.py STRIKE_GAP)",
         fut_df=fut_ct,
+    )
+
+with tab_lrc:
+    atm_lrc_lbl = f"{int(atm_lrc):,}" if atm_lrc is not None else "—"
+    render_commodity_tab(
+        df=df_lrc, atm_val=atm_lrc, atm_label=atm_lrc_lbl,
+        old_date=old_date, new_date=new_date,
+        key_prefix="lrc", title="LRC", ric_fn=_ric_lrc,
+        display_step=25, mround_default=25,
+        ingest_note="MRound=25 $/tonne for ATM snap | Step=25 $/tonne | "
+                     "active months Jan/Mar/May/Jul/Sep/Nov only (confirmed live vs LSEG)",
+        fut_df=fut_lrc,
+    )
+
+with tab_lcc:
+    atm_lcc_lbl = f"{int(atm_lcc):,}" if atm_lcc is not None else "—"
+    render_commodity_tab(
+        df=df_lcc, atm_val=atm_lcc, atm_label=atm_lcc_lbl,
+        old_date=old_date, new_date=new_date,
+        key_prefix="lcc", title="LCC", ric_fn=_ric_lcc,
+        display_step=25, mround_default=25,
+        ingest_note="MRound=25 for ATM snap | Step=25 | "
+                     "active months Mar/May/Jul/Sep/Dec only (confirmed live vs LSEG)",
+        fut_df=fut_lcc,
     )
 
