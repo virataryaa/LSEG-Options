@@ -605,10 +605,16 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     )
 
     has_iv = "impvol" in df.columns and df["impvol"].notna().any()
-    tab_labels = ["OI Change + Volume", "Px Change"] + (["Vol Surface (Proof of Concept)"] if has_iv else [])
+    has_fut = fut_df is not None and not fut_df.empty
+    tab_labels = ["OI Change + Volume", "Px Change"]
+    if has_iv:
+        tab_labels.append("Vol Surface (Proof of Concept)")
+    if has_iv and has_fut:
+        tab_labels.append("IV vs RV")
     inner_tabs  = st.tabs(tab_labels)
     inner1, inner2 = inner_tabs[0], inner_tabs[1]
     inner3 = inner_tabs[2] if has_iv else None
+    inner4 = inner_tabs[3] if (has_iv and has_fut) else None
 
     with inner1:
         cl, cr = st.columns(2)
@@ -1126,6 +1132,131 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                         st.caption(f"ATM anchored to {src} for each expiry — serial months mapped to next available futures contract.")
                 else:
                     st.info("Not enough ImpVol history to plot term structure.")
+
+    if inner4 is not None:
+        with inner4:
+            rv_window_label = st.radio(
+                "Realized vol window", ["10d", "20d", "30d", "60d"], index=1, horizontal=True,
+                key=f"{key_prefix}_rv_window",
+                help="Trailing window of daily log returns used to compute realized vol, annualized (×√252)."
+            )
+            rv_window = int(rv_window_label.replace("d", ""))
+
+            all_d_rv = sorted(df[df["impvol"].notna()]["date"].dt.date.unique())
+            if len(all_d_rv) < 2:
+                st.info("Not enough ImpVol history to compare against realized vol.")
+            else:
+                dr_rv = st.slider("Date Range", min_value=all_d_rv[0], max_value=all_d_rv[-1],
+                                   value=(all_d_rv[0], all_d_rv[-1]), key=f"{key_prefix}_rv_dr")
+
+                col_labels_rv = {mk: f"{MONTH_NAMES[mk[0]]} '{str(mk[1])[-2:]}" for mk in month_keys}
+                mk_lookup_rv  = {v: k for k, v in col_labels_rv.items()}
+                sel_exp_rv = st.multiselect(
+                    "Expiries to show", list(col_labels_rv.values()),
+                    default=list(col_labels_rv.values())[:3], key=f"{key_prefix}_rv_exp"
+                )
+
+                sub_rv = df[
+                    (df["date"].dt.date >= dr_rv[0]) & (df["date"].dt.date <= dr_rv[1]) &
+                    df["impvol"].notna()
+                ].copy()
+                sub_rv["mk_label"] = (sub_rv["expiry_month"].map(MONTH_NAMES)
+                                      + " '" + sub_rv["expiry_year"].astype(str).str[-2:])
+
+                # Same Regular/Serial -> next-listed-futures-month mapping used for
+                # ATM anchoring elsewhere in this tab (see Row 2b/3 above) — a serial
+                # expiry's IV is compared against the realized vol of the SAME
+                # underlying futures contract it settles against, not its own price
+                # history (options don't have one; they cash/physically settle into
+                # the futures contract).
+                fut_month_ints = sorted(fut_df["month_int"].dropna().unique().tolist())
+                unique_exp_rv = sub_rv[["expiry_month", "expiry_year"]].drop_duplicates()
+                exp_to_fut_rv = {}
+                for _, r in unique_exp_rv.iterrows():
+                    em, ey = int(r.expiry_month), int(r.expiry_year)
+                    fm = next((m for m in fut_month_ints if m >= em), fut_month_ints[0])
+                    fy = ey if any(m >= em for m in fut_month_ints) else ey + 1
+                    exp_to_fut_rv[(em, ey)] = (fm, fy)
+                sub_rv["_fut_m"] = sub_rv.apply(
+                    lambda r: exp_to_fut_rv.get((int(r.expiry_month), int(r.expiry_year)), (None, None))[0], axis=1)
+                sub_rv["_fut_y"] = sub_rv.apply(
+                    lambda r: exp_to_fut_rv.get((int(r.expiry_month), int(r.expiry_year)), (None, None))[1], axis=1)
+                fut_settle_rv = (fut_df.rename(columns={"Date": "date"})
+                                 .rename(columns={"month_int": "_fut_m", "year": "_fut_y"}))
+                sub_rv = sub_rv.merge(fut_settle_rv[["date", "_fut_m", "_fut_y", "settlement"]],
+                                      on=["date", "_fut_m", "_fut_y"], how="left")
+                sub_rv["settlement"] = sub_rv["settlement"].fillna(custom_atm)
+                sub_rv["atm_dist"] = (sub_rv["strike"] - sub_rv["settlement"]).abs()
+
+                atm_iv_rv = (sub_rv.sort_values("atm_dist")
+                             .groupby(["date", "mk_label"]).first()
+                             .reset_index()[["date", "mk_label", "impvol"]])
+                atm_iv_rv["date"] = pd.to_datetime(atm_iv_rv["date"])
+                iv_pivot_rv = atm_iv_rv.pivot(index="date", columns="mk_label", values="impvol")
+                iv_pivot_rv.columns.name = None
+
+                # Realized vol per underlying futures contract: daily log returns,
+                # rolling std over rv_window trading days, annualized.
+                fut_hist = fut_df.rename(columns={"Date": "date"}).copy()
+                fut_hist["date"] = pd.to_datetime(fut_hist["date"])
+                rv_by_contract = {}
+                for (fm, fy) in set(exp_to_fut_rv.values()):
+                    fc = fut_hist[(fut_hist["month_int"] == fm) & (fut_hist["year"] == fy)].sort_values("date")
+                    fc = fc[fc["settlement"].notna()]
+                    if len(fc) < rv_window + 1:
+                        continue
+                    log_ret = np.log(fc["settlement"].astype(float) / fc["settlement"].astype(float).shift(1))
+                    rv = log_ret.rolling(rv_window).std() * np.sqrt(252) * 100
+                    rv_by_contract[(fm, fy)] = pd.Series(rv.values, index=fc["date"].values).dropna()
+
+                if not sel_exp_rv:
+                    st.info("Select at least one expiry above.")
+                else:
+                    fig_rv = go.Figure()
+                    colors = ["#4285f4", "#dc4b4b", "#f59e0b", "#34a853", "#8b5cf6", "#06b6d4", "#f97316"]
+                    any_trace = False
+                    for i, mk_label in enumerate(sel_exp_rv):
+                        color = colors[i % len(colors)]
+                        if mk_label in iv_pivot_rv.columns:
+                            s = iv_pivot_rv[mk_label].dropna()
+                            if not s.empty:
+                                any_trace = True
+                                fig_rv.add_trace(go.Scatter(
+                                    x=s.index, y=s.values, mode="lines", name=f"{mk_label} IV",
+                                    line=dict(color=color, width=1.8)
+                                ))
+                        match = mk_lookup_rv.get(mk_label)
+                        fut_key = exp_to_fut_rv.get(match) if match else None
+                        if fut_key and fut_key in rv_by_contract:
+                            rv_s = rv_by_contract[fut_key]
+                            rv_s = rv_s[(rv_s.index.normalize() >= pd.Timestamp(dr_rv[0])) &
+                                        (rv_s.index.normalize() <= pd.Timestamp(dr_rv[1]))]
+                            if not rv_s.empty:
+                                any_trace = True
+                                fig_rv.add_trace(go.Scatter(
+                                    x=rv_s.index, y=rv_s.values, mode="lines",
+                                    name=f"{mk_label} RV ({rv_window}d)",
+                                    line=dict(color=color, width=1.8, dash="dot")
+                                ))
+
+                    if not any_trace:
+                        st.info("No IV or realized-vol data in the selected range for these expiries.")
+                    else:
+                        fig_rv.update_layout(
+                            height=380, margin=dict(l=40, r=20, t=30, b=40),
+                            xaxis_title="Date", yaxis_title="Vol %",
+                            legend=dict(orientation="h", y=-0.25),
+                            plot_bgcolor="#fafafa", paper_bgcolor="#fafafa"
+                        )
+                        st.plotly_chart(fig_rv, use_container_width=True)
+                        st.caption(
+                            f"Solid = ATM implied vol per expiry. Dotted = {rv_window}-day realized vol "
+                            "(annualized, from daily log returns) of the underlying futures contract each "
+                            "expiry settles against — serial-month expiries share their Regular contract's "
+                            "realized vol, same mapping as the ATM anchoring above. A large IV-over-RV gap "
+                            "means options are pricing in more movement than has actually happened; IV "
+                            "under RV means the reverse."
+                        )
 
 
 # ── Main layout ────────────────────────────────────────────────────────────────
