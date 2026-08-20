@@ -485,7 +485,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     _def_step   = float(display_step if display_step else (step if atm_val is not None and len(all_strikes_data) > 1 else 1.0))
     _def_mround = float(mround_default if mround_default is not None else _def_step)
 
-    with st.expander("Controls", expanded=True):
+    with st.expander("Controls", expanded=False):
         col_oi, col_price, col_mround, col_step, col_mode = st.columns([1, 1.2, 0.8, 0.8, 1.4])
         with col_oi:
             min_oi = st.number_input("Min OI filter (New Date)", value=0, min_value=0,
@@ -566,6 +566,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     cp_vol = f"{c_vol/p_vol:.2f}"     if p_vol > 0  else "—"
 
     items = [
+        ("ATM Price",     f"{custom_atm:,.2f}"),
         ("Call OI Delta", _fn(c_oi)),
         ("Put OI Delta",  _fn(p_oi)),
         ("Call Volume",   _fn(c_vol)),
@@ -742,8 +743,14 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                 dr = st.slider("Date Range", min_value=all_d[0], max_value=all_d[-1],
                                value=(all_d[0], all_d[-1]), key=f"{key_prefix}_ts_dr")
                 sub = df[(df["date"].dt.date >= dr[0]) & (df["date"].dt.date <= dr[1])].copy()
+                # min_count=1: a date where OI is null across every strike (LSEG
+                # publishes OI a day behind Settle/Volume, so the latest date is
+                # routinely all-null) must sum to NaN, not 0 — plain .sum()
+                # treats an all-NaN group as 0, which drew a false plunge to zero
+                # on the most recent point instead of leaving it as a gap.
                 daily = (sub.groupby(["date", "option_type"])
-                         .agg(oi=("oi", "sum"), volume=("volume", "sum"))
+                         .agg(oi=("oi", lambda s: s.sum(min_count=1)),
+                              volume=("volume", lambda s: s.sum(min_count=1)))
                          .reset_index())
                 tc1, tc2 = st.columns(2)
                 with tc1:
@@ -908,14 +915,17 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                 snap_new = _ts_snapshot(new_date, fut_df, custom_atm)
                 snap_old = _ts_snapshot(old_date, fut_df, custom_atm)
 
-                # OI per expiry on new_date
+                # OI per expiry on new_date. min_count=1 so an expiry with OI
+                # null across every strike on this date (LSEG publishes OI a
+                # day behind Settle/Volume, so the latest date is routinely
+                # all-null) sums to NaN, not a misleading 0 bar.
                 oi_snap = (
                     df[df["date"].dt.date == new_date]
                     .assign(mk_label=lambda d: d["expiry_month"].map(MONTH_NAMES)
                                                + " '" + d["expiry_year"].astype(str).str[-2:],
                             sort_key=lambda d: d["expiry_year"] * 100 + d["expiry_month"])
                     .groupby(["mk_label", "sort_key"], as_index=False)["oi"]
-                    .sum()
+                    .sum(min_count=1)
                     .sort_values("sort_key")
                 )
 
