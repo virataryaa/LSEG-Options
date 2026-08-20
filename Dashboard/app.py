@@ -398,7 +398,8 @@ def butterfly_html(cpiv, ppiv, atm, cfn, month_keys, fmt="{:.0f}",
     ft = ""
     if footer:
         def cs(piv, mk):
-            if piv.empty or mk not in piv.columns: return 0.0
+            if piv.empty or mk not in piv.columns or piv[mk].notna().sum() == 0:
+                return float("nan")
             return float(piv[mk].sum(skipna=True))
         cft = "".join(td(cs(cpiv, mk)) for mk in ccols)
         pft = "".join(td(cs(ppiv, mk)) for mk in pcols)
@@ -413,10 +414,23 @@ def butterfly_html(cpiv, ppiv, atm, cfn, month_keys, fmt="{:.0f}",
 
 
 # ── Misc helpers ───────────────────────────────────────────────────────────────
-def _tot(piv): return float(piv.sum(skipna=True).sum()) if not piv.empty else 0.0
+def _tot(piv):
+    # NaN, not 0.0, when the pivot has genuinely no data (e.g. OI is null
+    # across the board on the very latest date — LSEG publishes OI a day
+    # behind Settle/Volume). piv.sum(skipna=True) alone silently turns an
+    # all-NaN column into 0, which read as "no positioning change" in the
+    # KPI row when the real answer is "no data yet for today".
+    if piv.empty or piv.notna().to_numpy().sum() == 0:
+        return float("nan")
+    return float(piv.sum(skipna=True).sum())
 def _fn(v, f="{:,.0f}"):
-    try: return f.format(float(v))
-    except: return "—"
+    try:
+        v = float(v)
+        if pd.isna(v):
+            return "—"
+        return f.format(v)
+    except Exception:
+        return "—"
 
 # RIC reconstruction — LSEG scheme (interim migration), NOT the ICE
 # "<ROOT> <month><yy><C/P><strike>" scheme these were originally written
@@ -564,8 +578,10 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
 
     c_oi  = _tot(call_oi);  p_oi  = _tot(put_oi)
     c_vol = _tot(call_vol); p_vol = _tot(put_vol)
-    cp_oi  = f"{abs(c_oi/p_oi):.2f}"  if p_oi  != 0 else "—"
-    cp_vol = f"{c_vol/p_vol:.2f}"     if p_vol > 0  else "—"
+    # np.isnan guards explicitly — plain `!= 0` is True for NaN in Python,
+    # which would have computed NaN/NaN and displayed the literal "nan".
+    cp_oi  = (f"{abs(c_oi/p_oi):.2f}" if p_oi and not np.isnan(p_oi) and p_oi != 0 and not np.isnan(c_oi) else "—")
+    cp_vol = (f"{c_vol/p_vol:.2f}"    if p_vol and not np.isnan(p_vol) and p_vol > 0 and not np.isnan(c_vol) else "—")
 
     items = [
         ("ATM Price",     f"{custom_atm:,.2f}"),
