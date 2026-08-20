@@ -160,6 +160,7 @@ def _valid(df, opt, new_date, min_oi):
     d2 = df[(df["date"].dt.date == new_date) & (df["option_type"] == opt)][["ric", "oi"]]
     return d2[pd.to_numeric(d2["oi"], errors="coerce") >= min_oi]["ric"]
 
+@st.cache_data(ttl=1800)
 def _change_pivot(df, month_keys, opt, src, old_date, new_date, min_oi):
     d1 = (df[(df["date"].dt.date == old_date) & (df["option_type"] == opt)]
           [["ric", src]].set_index("ric"))
@@ -183,6 +184,7 @@ def get_oi_pivot(df, month_keys, opt, old_date, new_date, min_oi):
 def get_px_pivot(df, month_keys, opt, old_date, new_date, min_oi):
     return _change_pivot(df, month_keys, opt, "settle", old_date, new_date, min_oi)
 
+@st.cache_data(ttl=1800)
 def get_vol_pivot(df, month_keys, opt, old_date, new_date, min_oi):
     lo, hi = min(old_date, new_date), max(old_date, new_date)
     sub = df[(df["option_type"] == opt)
@@ -215,6 +217,7 @@ def get_pct_pivot(df, month_keys, opt, old_date, new_date, min_oi):
     piv = result.pivot_table(index="strike", columns="mk", values="val", aggfunc="first")
     return _clean(piv, month_keys).sort_index(ascending=False)
 
+@st.cache_data(ttl=1800)
 def get_iv_pivot(df, month_keys, opt, snap_date, min_oi):
     """Snapshot of ImpVol by strike × expiry on snap_date."""
     if "impvol" not in df.columns:
@@ -228,6 +231,7 @@ def get_iv_pivot(df, month_keys, opt, snap_date, min_oi):
     piv = result.pivot_table(index="strike", columns="mk", values="impvol", aggfunc="first")
     return _clean(piv, month_keys).sort_index(ascending=False)
 
+@st.cache_data(ttl=1800)
 def get_iv_change_pivot(df, month_keys, opt, old_date, new_date, min_oi):
     """ImpVol change (new − old) by strike × expiry."""
     if "impvol" not in df.columns:
@@ -245,6 +249,7 @@ def get_iv_change_pivot(df, month_keys, opt, old_date, new_date, min_oi):
     piv = result.pivot_table(index="strike", columns="mk", values="val", aggfunc="first")
     return _clean(piv, month_keys).sort_index(ascending=False)
 
+@st.cache_data(ttl=1800)
 def get_oi_snapshot_pivot(df, month_keys, opt, snap_date, new_date, min_oi):
     d = (df[(df["date"].dt.date == snap_date) & (df["option_type"] == opt)]
          [["ric", "oi"]].set_index("ric"))
