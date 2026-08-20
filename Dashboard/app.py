@@ -899,17 +899,22 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                         sub["settlement"] = sub["settlement"].fillna(custom_atm)
                         sub["atm_dist"] = (sub["strike"] - sub["settlement"]).abs()
                     else:
+                        sub["settlement"] = custom_atm
                         sub["atm_dist"] = (sub["strike"] - custom_atm).abs()
 
+                    has_futures = fut_df is not None and not fut_df.empty
                     rows = []
                     for (lbl, sk), grp in sub.groupby(["mk_label", "sort_key"]):
-                        atm_s = grp.loc[grp["atm_dist"].idxmin(), "strike"]
+                        atm_s  = grp.loc[grp["atm_dist"].idxmin(), "strike"]
+                        anchor = float(grp["settlement"].iloc[0])  # same for the whole expiry group
                         atm_g = grp[grp["strike"] == atm_s]
                         iv_c  = atm_g[atm_g["option_type"] == "Call"]["impvol"].mean()
                         iv_p  = atm_g[atm_g["option_type"] == "Put"]["impvol"].mean()
                         rows.append({"mk_label": lbl, "sort_key": sk,
                                      "iv_call": iv_c, "iv_put": iv_p,
-                                     "iv_avg": float(pd.Series([iv_c, iv_p]).mean())})
+                                     "iv_avg": float(pd.Series([iv_c, iv_p]).mean()),
+                                     "anchor_px": anchor, "anchor_strike": atm_s,
+                                     "anchor_src": "Futures settlement" if has_futures else "ATM snap"})
                     return pd.DataFrame(rows).sort_values("sort_key").reset_index(drop=True)
 
                 snap_new = _ts_snapshot(new_date, fut_df, custom_atm)
@@ -951,17 +956,25 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                             showlegend=True
                         ))
 
+                    anchor_hover = (
+                        "<b>%{x}</b><br>Call IV: %{y:.1f}%<br>"
+                        "Anchor: %{customdata[0]:,.2f} (strike %{customdata[1]}, %{customdata[2]})<extra></extra>"
+                    )
                     fig_sn.add_trace(go.Scatter(
                         x=snap_new["mk_label"], y=snap_new["iv_call"],
                         mode="lines+markers", name=f"Call IV ({new_date})",
                         line=dict(color="#4285f4", width=2), marker=dict(size=7),
-                        yaxis="y1"
+                        yaxis="y1",
+                        customdata=snap_new[["anchor_px", "anchor_strike", "anchor_src"]].values,
+                        hovertemplate=anchor_hover,
                     ))
                     fig_sn.add_trace(go.Scatter(
                         x=snap_new["mk_label"], y=snap_new["iv_put"],
                         mode="lines+markers", name=f"Put IV ({new_date})",
                         line=dict(color="#dc4b4b", width=2), marker=dict(size=7),
-                        yaxis="y1"
+                        yaxis="y1",
+                        customdata=snap_new[["anchor_px", "anchor_strike", "anchor_src"]].values,
+                        hovertemplate=anchor_hover.replace("Call IV", "Put IV"),
                     ))
                     if not snap_old.empty:
                         fig_sn.add_trace(go.Scatter(
@@ -988,6 +1001,11 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                         "low-OI expiries have unreliable vol readings. "
                         "Upward slope = contango. Downward = backwardation."
                     )
+                    anchor_line = "  |  ".join(
+                        f"{r.mk_label}: {r.anchor_px:,.2f} (strike {r.anchor_strike}, {r.anchor_src})"
+                        for r in snap_new.itertuples()
+                    )
+                    st.caption(f"**Live price used per expiry ({new_date}):** {anchor_line}")
 
             # ── Row 3: ATM Vol Term Structure ─────────────────────────────────
             with st.expander("ATM Vol Term Structure — ImpVol at ATM across expiries"):

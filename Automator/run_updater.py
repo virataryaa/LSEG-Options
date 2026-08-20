@@ -6,6 +6,7 @@ Each commodity's ingest is independent — one failing doesn't stop the rest,
 but any failure marks the whole run as failed for the email subject/exit code.
 """
 
+import shutil
 import subprocess
 import sys
 import datetime
@@ -29,6 +30,22 @@ COMMODITIES = {
 }
 ATM_JSON = ROOT / "Dashboard" / "atm.json"
 
+# Daily-refreshed master Futures database (separate migration, its own
+# automator keeps it current every morning) — synced in here for the
+# Dashboard's per-expiry ATM anchor (Vol Term Structure panel). Source
+# uses "rc" for Robusta; Options RICs use "LRC", so that one is renamed
+# on copy — everything else copies straight across.
+FUTURES_SRC = Path(r"C:\Users\virat.arya\ETG\SoftsDatabase - Documents\Database\Hardmine\Interim_Migration\Futures\Database")
+FUTURES_DST = ROOT / "Database" / "Futures"
+FUTURES_MAP = {
+    "kc_futures.parquet":  "kc_futures.parquet",
+    "cc_futures.parquet":  "cc_futures.parquet",
+    "sb_futures.parquet":  "sb_futures.parquet",
+    "ct_futures.parquet":  "ct_futures.parquet",
+    "lcc_futures.parquet": "lcc_futures.parquet",
+    "rc_futures.parquet":  "lrc_futures.parquet",
+}
+
 EMAIL_TO = "virat.arya@etgworld.com"
 
 
@@ -51,6 +68,22 @@ def send_email(subject: str, body: str):
         log("Email sent.")
     except Exception as e:
         log(f"Email failed: {e}")
+
+
+def sync_futures() -> tuple[bool, str]:
+    FUTURES_DST.mkdir(parents=True, exist_ok=True)
+    lines = []
+    ok = True
+    for src_name, dst_name in FUTURES_MAP.items():
+        src = FUTURES_SRC / src_name
+        dst = FUTURES_DST / dst_name
+        if not src.exists():
+            lines.append(f"  MISSING: {src}")
+            ok = False
+            continue
+        shutil.copy2(src, dst)
+        lines.append(f"  {src_name} -> {dst_name}")
+    return ok, "\n".join(lines)
 
 
 def run_ingest(script: Path, label: str) -> tuple[bool, str]:
@@ -86,6 +119,11 @@ def main():
     log("=" * 50)
     log(f"Options ingest (LSEG) started — {today}")
 
+    fut_ok, fut_out = sync_futures()
+    log(f"Futures sync: {'OK' if fut_ok else 'PARTIAL/FAILED'}")
+    for line in fut_out.splitlines():
+        log(f"  {line}")
+
     results = {}
     any_failed = False
     for label, (script, _parquet) in COMMODITIES.items():
@@ -97,13 +135,15 @@ def main():
         if not ok:
             any_failed = True
 
-    files_to_push = [p for _s, p in COMMODITIES.values()] + [ATM_JSON]
+    futures_files = [FUTURES_DST / name for name in FUTURES_MAP.values()]
+    files_to_push = [p for _s, p in COMMODITIES.values()] + [ATM_JSON] + futures_files
     pushed, git_out = git_push(files_to_push)
     log("Git push: OK" if pushed else "Git push: FAILED (may be nothing new)")
     for line in git_out.strip().splitlines():
         log(f"  {line}")
 
-    body_parts = [f"Options ingest (LSEG) completed — {today}\n"]
+    body_parts = [f"Options ingest (LSEG) completed — {today}\n",
+                  f"=== Futures sync ({'OK' if fut_ok else 'PARTIAL/FAILED'}) ===\n{fut_out}\n"]
     for label, (ok, out) in results.items():
         body_parts.append(f"=== {label} ({'OK' if ok else 'FAILED'}) ===\n{out.strip()}\n")
     body_parts.append(f"Git: {'pushed' if pushed else 'nothing new / failed'}\n{git_out.strip()}")
