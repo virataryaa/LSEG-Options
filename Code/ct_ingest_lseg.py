@@ -39,7 +39,16 @@ ATM_JSON     = DASH_DIR / "atm.json"
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--full", action="store_true")
+    parser.add_argument("--full", action="store_true", help="Backfill BACKFILL_DAYS instead of incremental")
+    parser.add_argument("--days", type=int, default=None, help="Override the fetch window in days")
+    parser.add_argument("--legacy-window", action="store_true",
+                        help="Use the old ATM +/- window universe instead of LSEG discovery")
+    parser.add_argument("--weeklies", action="store_true",
+                        help="Also ingest weekly/serial options (collide with monthlies on (strike,month,year))")
+    parser.add_argument("--require-oi", action="store_true",
+                        help="Prefilter to OI>0 only (old behaviour); default also keeps settle-quoted strikes")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Report universe and coverage, then exit without writing the parquet")
     args = parser.parse_args()
 
     log = c.make_logger("ct_ingest_lseg", Path(__file__).parent / "logs")
@@ -49,7 +58,9 @@ def main():
         months_forward=MONTHS_FORWARD, backfill_days=BACKFILL_DAYS,
         rolling_days=ROLLING_DAYS, batch_size=BATCH_SIZE,
         parquet_path=PARQUET_PATH, atm_json=ATM_JSON, log=log,
-        force_full=args.full,
+        force_full=args.full, use_discovery=not args.legacy_window,
+        include_weeklies=args.weeklies, require_oi=args.require_oi,
+        dry_run=args.dry_run, days=args.days,
     )
 
 
