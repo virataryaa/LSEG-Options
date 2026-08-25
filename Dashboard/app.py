@@ -115,14 +115,17 @@ def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
     series = {p["ric"]: df[df["ric"] == p["ric"]].sort_values("date") for p in picks}
     has_iv = any("impvol" in s.columns and s["impvol"].notna().any() for s in series.values())
 
-    fields = [("oi", "Open Interest", "{:,.0f}"),
-              ("volume", "Volume", "{:,.0f}"),
-              ("settle", "Settle Price", "{:,.2f}")]
+    # Volume is drawn as bars, not lines: it is a per-session quantity that is
+    # frequently zero or unreported, and a line interpolates straight through
+    # those gaps — reading as steady trade on days nothing changed hands.
+    fields = [("oi", "Open Interest", "line"),
+              ("volume", "Volume", "bar"),
+              ("settle", "Settle Price", "line")]
     if has_iv:
-        fields.append(("impvol", "Implied Vol %", "{:,.2f}"))
+        fields.append(("impvol", "Implied Vol %", "line"))
 
     figs = []
-    for field, label, _f in fields:
+    for field, label, kind in fields:
         fig = go.Figure()
         drew = False
         for i, p in enumerate(picks):
@@ -130,14 +133,26 @@ def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
             if field not in sdf.columns:
                 continue
             s = pd.to_numeric(sdf.set_index("date")[field], errors="coerce").dropna()
+            if kind == "bar":
+                s = s[s != 0]  # a zero-height bar is just noise on the axis
             if s.empty:
                 continue
             drew = True
-            fig.add_trace(go.Scatter(
-                x=s.index, y=s.values, mode="lines", name=p["label"],
-                line=dict(color=c.SERIES_COLORS[i % len(c.SERIES_COLORS)], width=1.8),
-                hovertemplate=f"<b>{p['label']}</b><br>%{{x|%d %b %Y}}<br>{label}: %{{y:,.2f}}<extra></extra>",
-            ))
+            color = c.SERIES_COLORS[i % len(c.SERIES_COLORS)]
+            hover = (f"<b>{p['label']}</b><br>%{{x|%d %b %Y}}<br>"
+                     f"{label}: %{{y:,.2f}}<extra></extra>")
+            if kind == "bar":
+                fig.add_trace(go.Bar(
+                    x=s.index, y=s.values, name=p["label"],
+                    marker=dict(color=color, line=dict(width=0)),
+                    hovertemplate=hover,
+                ))
+            else:
+                fig.add_trace(go.Scatter(
+                    x=s.index, y=s.values, mode="lines", name=p["label"],
+                    line=dict(color=color, width=1.8),
+                    hovertemplate=hover,
+                ))
         fig.update_layout(
             title=dict(text=label, x=0, font=dict(size=13)),
             height=300, margin=dict(l=45, r=15, t=35, b=35),
@@ -145,7 +160,12 @@ def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
             legend=dict(orientation="h", y=-0.18, font=dict(size=9)),
             plot_bgcolor="#fafafa", paper_bgcolor="#fafafa",
             hovermode="x unified",
+            # group so overlapping series sit side by side instead of hiding
+            # each other; bargap keeps single-name days from looking like slabs
+            barmode="group", bargap=0.15, bargroupgap=0.05,
         )
+        if kind == "bar":
+            fig.update_yaxes(rangemode="tozero")
         figs.append((fig, drew, label))
 
     st.caption(" · ".join(f"**{p['label']}** ({p['ric']}, {len(series[p['ric']])}d)" for p in picks))
