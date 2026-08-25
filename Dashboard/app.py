@@ -75,6 +75,15 @@ def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
 
     st.caption(f"OI as of **{snap.strftime('%d %b %Y')}** — "
                f"tick up to **{MAX_DRILL}** rows across both tables to overlay them.")
+
+    # Streamlit exposes no API to clear a dataframe's row selection, and its
+    # widget state is not writable from here. Rotating a nonce through the
+    # widget key rebuilds both tables as fresh widgets, which is the reliable
+    # way to land on an empty selection.
+    nonce_key = f"{key_prefix}_dd_nonce"
+    nonce = st.session_state.get(nonce_key, 0)
+    call_key, put_key = f"{key_prefix}_dd_call_{nonce}", f"{key_prefix}_dd_put_{nonce}"
+
     ddc1, ddc2 = st.columns(2)
     with ddc1:
         st.markdown("**Calls**")
@@ -83,7 +92,7 @@ def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
                      .apply(style_oi, rgb="66,133,244", subset=["OI"])
                      .format({"Strike": c.fmt_strike, "OI": "{:,.0f}"}),
             on_select="rerun", selection_mode="multi-row",
-            key=f"{key_prefix}_dd_call", width="stretch", hide_index=True,
+            key=call_key, width="stretch", hide_index=True,
         )
     with ddc2:
         st.markdown("**Puts**")
@@ -92,7 +101,7 @@ def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
                     .apply(style_oi, rgb="220,75,75", subset=["OI"])
                     .format({"Strike": c.fmt_strike, "OI": "{:,.0f}"}),
             on_select="rerun", selection_mode="multi-row",
-            key=f"{key_prefix}_dd_put", width="stretch", hide_index=True,
+            key=put_key, width="stretch", hide_index=True,
         )
 
     picks = []
@@ -103,6 +112,22 @@ def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
                 picks.append(dict(
                     ric=r["ric"], opt=opt, strike=r["Strike"], expiry=r["Expiry"],
                     label=f"{c.fmt_strike(r['Strike'])} {opt} {r['Expiry']}"))
+
+    bc1, bc2 = st.columns([1, 4])
+    with bc1:
+        if st.button(f"Clear selection ({len(picks)})", key=f"{key_prefix}_dd_clear",
+                     disabled=not picks, width="stretch",
+                     help="Deselect every option in both tables."):
+            st.session_state[nonce_key] = nonce + 1
+            # drop the retired widgets' state so repeated clears don't accumulate
+            for stale in [k for k in st.session_state
+                          if k.startswith((f"{key_prefix}_dd_call_", f"{key_prefix}_dd_put_"))
+                          and not k.endswith(f"_{nonce + 1}")]:
+                try:
+                    del st.session_state[stale]
+                except KeyError:
+                    pass
+            st.rerun()
 
     if not picks:
         st.caption("Tick rows above to chart them. Multiple selections overlay on one chart.")
