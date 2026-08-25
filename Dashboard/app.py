@@ -3,13 +3,12 @@ app.py — Soft Options Dashboard (ICE Connect data) — OI Change + Volume
 ========================================================================
 Commodities : KC (Coffee C) | CC (Cocoa) | SB (Sugar #11) | CT | LRC | LCC
 Sidebar     : Old Date + New Date (shared)
-Each Tab    : Min OI + ATM info, then OI Change (left) | Volume (right)
-              butterfly tables, OI Snapshot, Drill-Down time series,
-              and OI & Volume time series across all strikes.
+Each Tab    : Controls + KPI row, then OI Change (left) | Volume (right)
+              butterfly tables, OI Snapshot, multi-select Drill Down, and
+              OI & Volume time series across all strikes.
 
-Split out of the original monolithic app.py for load/response speed —
-Px Change, Vol Surface, and IV vs RV now live in oi_advanced_analytics.py
-(same folder). Shared code lives in common.py.
+Px Change, Vol Surface, and IV vs RV live in oi_advanced_analytics.py.
+Shared code lives in common.py.
 """
 
 import streamlit as st
@@ -23,35 +22,184 @@ st.set_page_config(page_title="Options Dashboard", layout="wide")
 dfs, atm_data = c.load_core_data()
 old_date, new_date = c.render_sidebar(dfs, title="Options Dashboard")
 
+MAX_DRILL = 8  # distinct colors available for overlaid series
 
-# ── Commodity tab renderer — OI Change + Volume only ───────────────────────────
+
+def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
+    """Multi-select option picker + overlaid OI / Volume / Settle / ImpVol charts."""
+    import plotly.graph_objects as go  # lazy — keeps cold start fast
+
+    # OI is published a session late, so list from the most recent date that
+    # actually has it rather than showing an empty picker.
+    snap = c.latest_oi_date(df, on_or_before=new_date) or new_date
+    if snap != new_date:
+        st.caption(f"OI not published for {new_date.strftime('%d %b %Y')} — "
+                   f"listing positions as of **{snap.strftime('%d %b %Y')}**.")
+
+    col_labels = {mk: f"{c.MONTH_NAMES[mk[0]]} '{str(mk[1])[-2:]}" for mk in month_keys}
+
+    def flat(opt):
+        d = df[(df["date"].dt.date == snap) & (df["option_type"] == opt)][
+            ["ric", "strike", "expiry_month", "expiry_year", "oi"]].copy()
+        if d.empty:
+            return pd.DataFrame(columns=["Strike", "Expiry", "OI", "ric"])
+        d["OI"] = pd.to_numeric(d["oi"], errors="coerce")
+        d = d[d["OI"] > 0]
+        if min_oi > 0:
+            d = d[d["OI"] >= min_oi]
+        d["mk"] = list(zip(d["expiry_month"].astype(int), d["expiry_year"].astype(int)))
+        d["Expiry"] = d["mk"].map(col_labels)
+        d = d.dropna(subset=["Expiry"])
+        return (d.rename(columns={"strike": "Strike"})
+                 [["Strike", "Expiry", "OI", "ric"]]
+                 .sort_values(["Strike", "Expiry"]).reset_index(drop=True))
+
+    call_flat, put_flat = flat("Call"), flat("Put")
+
+    all_expiries = [col_labels[mk] for mk in month_keys]
+    fc1, fc2 = st.columns([1, 3])
+    with fc1:
+        exp_filter = st.selectbox("Filter by Expiry", ["All"] + all_expiries,
+                                  key=f"{key_prefix}_dd_exp_filter")
+    if exp_filter != "All":
+        call_show = call_flat[call_flat["Expiry"] == exp_filter].reset_index(drop=True)
+        put_show  = put_flat[put_flat["Expiry"] == exp_filter].reset_index(drop=True)
+    else:
+        call_show, put_show = call_flat, put_flat
+
+    def style_oi(s, rgb):
+        mx = s.max() if len(s) > 0 else 1.0
+        if pd.isna(mx) or mx == 0: mx = 1.0
+        return [f"background-color:rgba({rgb},{round(0.15+min(v/mx,1.0)*0.5,2)});color:#1a1a2e"
+                if pd.notna(v) and v > 0 else "" for v in s]
+
+    st.caption(f"OI as of **{snap.strftime('%d %b %Y')}** — "
+               f"tick up to **{MAX_DRILL}** rows across both tables to overlay them.")
+    ddc1, ddc2 = st.columns(2)
+    with ddc1:
+        st.markdown("**Calls**")
+        call_evt = st.dataframe(
+            call_show.drop(columns=["ric"]).style
+                     .apply(style_oi, rgb="66,133,244", subset=["OI"])
+                     .format({"Strike": c.fmt_strike, "OI": "{:,.0f}"}),
+            on_select="rerun", selection_mode="multi-row",
+            key=f"{key_prefix}_dd_call", width="stretch", hide_index=True,
+        )
+    with ddc2:
+        st.markdown("**Puts**")
+        put_evt = st.dataframe(
+            put_show.drop(columns=["ric"]).style
+                    .apply(style_oi, rgb="220,75,75", subset=["OI"])
+                    .format({"Strike": c.fmt_strike, "OI": "{:,.0f}"}),
+            on_select="rerun", selection_mode="multi-row",
+            key=f"{key_prefix}_dd_put", width="stretch", hide_index=True,
+        )
+
+    picks = []
+    for evt, show, opt in [(call_evt, call_show, "Call"), (put_evt, put_show, "Put")]:
+        for i in evt.selection.get("rows", []):
+            if i < len(show):
+                r = show.iloc[i]
+                picks.append(dict(
+                    ric=r["ric"], opt=opt, strike=r["Strike"], expiry=r["Expiry"],
+                    label=f"{c.fmt_strike(r['Strike'])} {opt} {r['Expiry']}"))
+
+    if not picks:
+        st.caption("Tick rows above to chart them. Multiple selections overlay on one chart.")
+        return
+
+    if len(picks) > MAX_DRILL:
+        st.warning(f"{len(picks)} rows selected — charting the first {MAX_DRILL}.")
+        picks = picks[:MAX_DRILL]
+
+    series = {p["ric"]: df[df["ric"] == p["ric"]].sort_values("date") for p in picks}
+    has_iv = any("impvol" in s.columns and s["impvol"].notna().any() for s in series.values())
+
+    fields = [("oi", "Open Interest", "{:,.0f}"),
+              ("volume", "Volume", "{:,.0f}"),
+              ("settle", "Settle Price", "{:,.2f}")]
+    if has_iv:
+        fields.append(("impvol", "Implied Vol %", "{:,.2f}"))
+
+    figs = []
+    for field, label, _f in fields:
+        fig = go.Figure()
+        drew = False
+        for i, p in enumerate(picks):
+            sdf = series[p["ric"]]
+            if field not in sdf.columns:
+                continue
+            s = pd.to_numeric(sdf.set_index("date")[field], errors="coerce").dropna()
+            if s.empty:
+                continue
+            drew = True
+            fig.add_trace(go.Scatter(
+                x=s.index, y=s.values, mode="lines", name=p["label"],
+                line=dict(color=c.SERIES_COLORS[i % len(c.SERIES_COLORS)], width=1.8),
+                hovertemplate=f"<b>{p['label']}</b><br>%{{x|%d %b %Y}}<br>{label}: %{{y:,.2f}}<extra></extra>",
+            ))
+        fig.update_layout(
+            title=dict(text=label, x=0, font=dict(size=13)),
+            height=300, margin=dict(l=45, r=15, t=35, b=35),
+            xaxis_title=None, yaxis_title=None,
+            legend=dict(orientation="h", y=-0.18, font=dict(size=9)),
+            plot_bgcolor="#fafafa", paper_bgcolor="#fafafa",
+            hovermode="x unified",
+        )
+        figs.append((fig, drew, label))
+
+    st.caption(" · ".join(f"**{p['label']}** ({p['ric']}, {len(series[p['ric']])}d)" for p in picks))
+    for a, b in [(0, 1), (2, 3)]:
+        cols = st.columns(2)
+        for col, idx in zip(cols, (a, b)):
+            if idx >= len(figs):
+                continue
+            fig, drew, label = figs[idx]
+            with col:
+                if drew:
+                    st.plotly_chart(fig, width="stretch",
+                                    key=f"{key_prefix}_dd_fig_{idx}")
+                else:
+                    st.info(f"No {label} data for the selected options.")
+
+
 def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
-                         key_prefix, title, ric_fn, display_step=None, mround_default=None,
-                         ingest_note=""):
+                         key_prefix, title, ric_fn, display_step=None,
+                         mround_default=None, ingest_note=""):
     if df.empty:
         st.info(f"No data available for {title}.")
         return
 
-    min_oi, custom_atm, custom_step, strike_mode, month_keys, all_strikes_data = c.render_controls(
+    cfg = c.render_controls(
         df, atm_val, atm_label, atm_data, key_prefix, title,
         display_step=display_step, mround_default=mround_default, ingest_note=ingest_note,
     )
-    all_strikes, snap_tol = c.build_strike_grid(custom_atm, custom_step, strike_mode, all_strikes_data)
+    min_oi     = cfg["min_oi"]
+    custom_atm = cfg["custom_atm"]
+    month_keys = cfg["month_keys"]
+    grid       = cfg["grid"]
+
+    c.oi_notice(df, new_date, title)
 
     call_oi  = c.get_oi_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
     put_oi   = c.get_oi_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
     call_vol = c.get_vol_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
     put_vol  = c.get_vol_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
 
-    c_oi  = c._tot(call_oi);  p_oi  = c._tot(put_oi)
-    c_vol = c._tot(call_vol); p_vol = c._tot(put_vol)
+    # KPIs are computed from the projected (visible) grid so they agree with the
+    # table footers instead of silently including strikes that are off-screen.
+    rows, tol = grid
+    vis = {k: c.project_to_grid(p, rows, tol, how="sum") for k, p in
+           dict(coi=call_oi, poi=put_oi, cvol=call_vol, pvol=put_vol).items()}
+    c_oi, p_oi   = c._tot(vis["coi"]),  c._tot(vis["poi"])
+    c_vol, p_vol = c._tot(vis["cvol"]), c._tot(vis["pvol"])
     # np.isnan guards explicitly — plain `!= 0` is True for NaN in Python,
     # which would have computed NaN/NaN and displayed the literal "nan".
     cp_oi  = (f"{abs(c_oi/p_oi):.2f}" if p_oi and not np.isnan(p_oi) and p_oi != 0 and not np.isnan(c_oi) else "—")
     cp_vol = (f"{c_vol/p_vol:.2f}"    if p_vol and not np.isnan(p_vol) and p_vol > 0 and not np.isnan(c_vol) else "—")
 
     items = [
-        ("ATM Price",     f"{custom_atm:,.2f}"),
+        ("ATM Price",     f"{custom_atm:,.4g}"),
         ("Call OI Delta", c._fn(c_oi)),
         ("Put OI Delta",  c._fn(p_oi)),
         ("Call Volume",   c._fn(c_vol)),
@@ -75,16 +223,14 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     with cl:
         st.markdown("**OI Change**")
         st.markdown(
-            c.butterfly_html(call_oi, put_oi, custom_atm, c.oi_color, month_keys,
-                           fmt="{:.0f}", footer=True, title=title,
-                           fixed_strikes=all_strikes, snap_tol=snap_tol),
+            c.render_butterfly(call_oi, put_oi, grid, custom_atm, c.oi_color, month_keys,
+                               how="sum", fmt="{:.0f}", footer=True, title=title),
             unsafe_allow_html=True)
     with cr:
         st.markdown("**Volume**")
         st.markdown(
-            c.butterfly_html(call_vol, put_vol, custom_atm, c.vol_color, month_keys,
-                           fmt="{:.0f}", footer=True, title=title,
-                           fixed_strikes=all_strikes, snap_tol=snap_tol),
+            c.render_butterfly(call_vol, put_vol, grid, custom_atm, c.vol_color, month_keys,
+                               how="sum", fmt="{:.0f}", footer=True, title=title),
             unsafe_allow_html=True)
 
     with st.expander("OI Snapshot — Old Date vs New Date"):
@@ -96,126 +242,18 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
         with sc1:
             st.markdown(f"**Old Date — {old_date.strftime('%d %b %Y')}**")
             st.markdown(
-                c.butterfly_html(call_oi_old, put_oi_old, custom_atm, c.vol_color, month_keys,
-                               fmt="{:.0f}", footer=False, title=title,
-                               fixed_strikes=all_strikes, snap_tol=snap_tol),
+                c.render_butterfly(call_oi_old, put_oi_old, grid, custom_atm, c.vol_color,
+                                   month_keys, how="sum", fmt="{:.0f}", footer=True, title=title),
                 unsafe_allow_html=True)
         with sc2:
             st.markdown(f"**New Date — {new_date.strftime('%d %b %Y')}**")
             st.markdown(
-                c.butterfly_html(call_oi_new, put_oi_new, custom_atm, c.vol_color, month_keys,
-                               fmt="{:.0f}", footer=False, title=title,
-                               fixed_strikes=all_strikes, snap_tol=snap_tol),
+                c.render_butterfly(call_oi_new, put_oi_new, grid, custom_atm, c.vol_color,
+                                   month_keys, how="sum", fmt="{:.0f}", footer=True, title=title),
                 unsafe_allow_html=True)
 
-    with st.expander("Drill Down — Single Option Time Series"):
-        call_dd_piv = c.get_oi_snapshot_pivot(df, month_keys, "Call", new_date, new_date, min_oi)
-        put_dd_piv  = c.get_oi_snapshot_pivot(df, month_keys, "Put",  new_date, new_date, min_oi)
-
-        col_labels = {mk: f"{c.MONTH_NAMES[mk[0]]} '{str(mk[1])[-2:]}" for mk in month_keys}
-        mk_lookup  = {v: k for k, v in col_labels.items()}
-
-        def _flat_list(piv):
-            rows = []
-            for strike in sorted(piv.index):
-                for mk in month_keys:
-                    if mk not in piv.columns:
-                        continue
-                    try:
-                        v = float(piv.at[strike, mk])
-                    except (TypeError, ValueError):
-                        continue
-                    if np.isnan(v) or v <= 0:
-                        continue
-                    rows.append({"Strike": strike, "Expiry": col_labels[mk], "OI": int(v)})
-            return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Strike", "Expiry", "OI"])
-
-        def _style_oi(s, rgb):
-            mx = s.max() if len(s) > 0 else 1.0
-            if pd.isna(mx) or mx == 0: mx = 1.0
-            return [f"background-color:rgba({rgb},{round(0.15+min(v/mx,1.0)*0.5,2)});color:#1a1a2e"
-                    if pd.notna(v) and v > 0 else "" for v in s]
-
-        call_flat = _flat_list(call_dd_piv)
-        put_flat  = _flat_list(put_dd_piv)
-
-        all_expiries = [col_labels[mk] for mk in month_keys]
-        fc1, fc2 = st.columns([1, 3])
-        with fc1:
-            exp_filter = st.selectbox("Filter by Expiry", ["All"] + all_expiries,
-                                      key=f"{key_prefix}_dd_exp_filter")
-
-        if exp_filter != "All":
-            call_show = call_flat[call_flat["Expiry"] == exp_filter].reset_index(drop=True)
-            put_show  = put_flat[put_flat["Expiry"]  == exp_filter].reset_index(drop=True)
-        else:
-            call_show, put_show = call_flat, put_flat
-
-        st.caption(f"OI as of **{new_date.strftime('%d %b %Y')}** — click a row to view its time series")
-        ddc1, ddc2 = st.columns(2)
-
-        def _fmt_strike(x):
-            return f"{x:.1f}" if x % 1 != 0 else f"{int(x)}"
-
-        has_iv = "impvol" in df.columns and df["impvol"].notna().any()
-
-        with ddc1:
-            st.markdown("**Calls**")
-            call_evt = st.dataframe(
-                call_show.style.apply(_style_oi, rgb="66,133,244", subset=["OI"])
-                         .format({"Strike": _fmt_strike, "OI": "{:,}"}),
-                on_select="rerun", selection_mode="single-row",
-                key=f"{key_prefix}_dd_call", use_container_width=True, hide_index=True,
-            )
-        with ddc2:
-            st.markdown("**Puts**")
-            put_evt = st.dataframe(
-                put_show.style.apply(_style_oi, rgb="220,75,75", subset=["OI"])
-                        .format({"Strike": _fmt_strike, "OI": "{:,}"}),
-                on_select="rerun", selection_mode="single-row",
-                key=f"{key_prefix}_dd_put", use_container_width=True, hide_index=True,
-            )
-
-        sel_type = sel_strike = sel_mk = None
-        c_rows = call_evt.selection.get("rows", [])
-        p_rows = put_evt.selection.get("rows", [])
-
-        if c_rows and not call_show.empty:
-            row = call_show.iloc[c_rows[0]]
-            sel_type, sel_strike, sel_mk = "Call", row["Strike"], mk_lookup.get(row["Expiry"])
-        elif p_rows and not put_show.empty:
-            row = put_show.iloc[p_rows[0]]
-            sel_type, sel_strike, sel_mk = "Put", row["Strike"], mk_lookup.get(row["Expiry"])
-
-        if sel_type and sel_strike is not None and sel_mk:
-            ric = ric_fn(sel_strike, sel_mk[0], sel_mk[1], sel_type)
-            rdf = df[df["ric"] == ric].sort_values("date")
-            strike_lbl = _fmt_strike(sel_strike)
-            exp_lbl    = f"{c.MONTH_NAMES[sel_mk[0]]} '{str(sel_mk[1])[-2:]}"
-            friendly   = f"{title} {exp_lbl} {strike_lbl} {sel_type} ({ric})"
-            st.caption(f"**{friendly}** — {len(rdf)} trading days")
-            if rdf.empty:
-                st.info(f"No data for {ric}")
-            else:
-                show_iv = has_iv and "impvol" in rdf.columns and rdf["impvol"].notna().any()
-                cc1, cc2, cc3, cc4 = st.columns(4 if show_iv else 3)
-                fields = [
-                    (cc1, "oi",     "Open Interest"),
-                    (cc2, "volume", "Volume"),
-                    (cc3, "settle", "Settle Price"),
-                ]
-                if show_iv:
-                    fields.append((cc4, "impvol", "Impl. Vol %"))
-                for col, field, label in fields:
-                    s = pd.to_numeric(rdf.set_index("date")[field], errors="coerce").dropna()
-                    if not s.empty:
-                        col.markdown(f"**{label}**")
-                        if field == "volume":
-                            col.bar_chart(s)
-                        else:
-                            col.line_chart(s)
-        else:
-            st.caption("Click any row above to view its time series.")
+    with st.expander("Drill Down — Option Time Series (multi-select)"):
+        _drilldown(df, key_prefix, title, new_date, min_oi, month_keys)
 
     with st.expander("OI & Volume Time Series — All Strikes"):
         all_d = sorted(df["date"].dt.date.unique())

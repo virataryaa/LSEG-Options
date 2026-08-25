@@ -2,13 +2,32 @@
 common.py — Shared data loaders, pivot helpers, and rendering utilities
 for the Options Dashboard apps.
 
-Split from the original monolithic app.py so that:
-  - app.py                  → OI Change + Volume only (fast, default view)
+  - app.py                   → OI Change + Volume (fast, default view)
   - oi_advanced_analytics.py → Px Change, Vol Surface, IV vs RV
 
 Each app runs as its own Streamlit process, so @st.cache_data caches are
-NOT shared between them — but that's fine, since each app only loads/
-computes what it actually renders.
+NOT shared between them — each app only loads/computes what it renders.
+
+Strike-grid design (see build_strike_grid / project_to_grid)
+-----------------------------------------------------------
+The butterfly tables show a ladder of strike rows centered on the ATM.
+Two modes, with deliberately different contracts:
+
+  Exact   — rows ARE the real strikes from the parquet, N each side of the
+            strike nearest ATM. No arithmetic grid, no bucketing, so no
+            strike is ever dropped or merged. "Step" does not apply here
+            and is disabled in the UI.
+
+  Nearest — a uniform arithmetic ladder at "Step" intervals, clamped to the
+            traded strike range, with each data strike snapped to its own
+            nearest row (within Step/2).
+
+Both paths go through project_to_grid(), which maps *data strike -> display
+row*. Because that is a function (each source strike has exactly one nearest
+row), a strike can never be counted on two rows, and rows are filled by
+aggregating collisions rather than silently dropping them. The footer total
+is then computed from the projected frame, so TOT always reconciles with the
+rows actually on screen.
 """
 
 import json
@@ -27,6 +46,10 @@ CALL_CODES     = {1:"A",2:"B",3:"C",4:"D",5:"E",6:"F",7:"G",8:"H",9:"I",10:"J",1
 PUT_CODES      = {1:"M",2:"N",3:"O",4:"P",5:"Q",6:"R",7:"S",8:"T",9:"U",10:"V",11:"W",12:"X"}
 MONTH_TO_CODE  = {1:"F",2:"G",3:"H",4:"J",5:"K",6:"M",7:"N",8:"Q",9:"U",10:"V",11:"X",12:"Z"}
 CODE_TO_MONTH_INT = {"F":1,"G":2,"H":3,"J":4,"K":5,"M":6,"N":7,"Q":8,"U":9,"V":10,"X":11,"Z":12}
+
+# Distinct series colors for multi-select drill-down charts.
+SERIES_COLORS = ["#4285f4", "#dc4b4b", "#f59e0b", "#34a853",
+                 "#8b5cf6", "#06b6d4", "#f97316", "#ec4899"]
 
 
 # ── Data loaders ───────────────────────────────────────────────────────────────
@@ -105,34 +128,74 @@ def load_core_data():
     return dict(KC=df_kc, CC=df_cc, SB=df_sb, CT=df_ct, LRC=df_lrc, LCC=df_lcc), atm_data
 
 
+# ── OI availability ────────────────────────────────────────────────────────────
+# LSEG publishes Open Interest a full session behind Settle/Volume, so the most
+# recent date in the parquet routinely has *zero* non-null OI for every strike.
+# Defaulting "New Date" to that date produced a completely blank OI Change table
+# and — because the Min OI filter keys off OI on New Date — silently blanked the
+# Volume table too the moment a filter was set. These helpers let the UI default
+# to, and fall back to, the latest date that actually carries OI.
+@st.cache_data(ttl=1800)
+def oi_dates(df: pd.DataFrame):
+    """Sorted list of dates where at least one strike has non-null OI."""
+    if df.empty or "oi" not in df.columns:
+        return []
+    g = df.groupby(df["date"].dt.date)["oi"].apply(lambda s: s.notna().any())
+    return sorted([d for d, ok in g.items() if ok])
+
+
+def latest_oi_date(df: pd.DataFrame, on_or_before=None):
+    """Most recent date carrying OI, optionally at or before a cutoff."""
+    ds = oi_dates(df)
+    if not ds:
+        return None
+    if on_or_before is not None:
+        ds = [d for d in ds if d <= on_or_before]
+    return ds[-1] if ds else None
+
+
 def render_sidebar(dfs, title="Options Dashboard"):
     """Shared Old Date / New Date picker + latest-data status. Returns (old_date, new_date)."""
     all_dates = set()
-    for _df in [dfs["KC"], dfs["CC"], dfs["SB"], dfs["CT"]]:
+    for _df in dfs.values():
         if not _df.empty:
             all_dates.update(_df["date"].dt.date.unique())
     available_dates = sorted(all_dates)
+
+    # Default New Date to the newest date that has OI somewhere, so the app
+    # lands on a view that actually renders instead of an all-blank table.
+    oi_any = set()
+    for _df in dfs.values():
+        oi_any.update(oi_dates(_df))
+    default_new = max(oi_any) if oi_any else (available_dates[-1] if available_dates else None)
+    default_new_idx = (available_dates.index(default_new)
+                       if default_new in available_dates else len(available_dates) - 1)
 
     with st.sidebar:
         st.title(title)
         st.divider()
         old_date = st.selectbox("Old Date", available_dates,
-                                 index=max(0, len(available_dates) - 10),
+                                 index=max(0, default_new_idx - 9),
                                  format_func=lambda d: d.strftime("%d %b %Y"))
         new_date = st.selectbox("New Date", available_dates,
-                                 index=len(available_dates) - 1,
+                                 index=max(0, default_new_idx),
                                  format_func=lambda d: d.strftime("%d %b %Y"))
         if old_date == new_date:
             st.warning("Old Date and New Date are the same.")
+        elif old_date > new_date:
+            st.warning("Old Date is after New Date — changes will be signed backwards.")
 
         st.divider()
         st.markdown("**Latest data available**")
-        for _label, _df in [("Arabica (KC)", dfs["KC"]), ("Robusta (LRC)", dfs["LRC"]),
-                            ("NYC Cocoa (CC)", dfs["CC"]), ("London Cocoa (LCC)", dfs["LCC"]),
-                            ("Sugar (SB)", dfs["SB"]), ("Cotton (CT)", dfs["CT"])]:
+        for _label, _key in [("Arabica (KC)", "KC"), ("Robusta (LRC)", "LRC"),
+                             ("NYC Cocoa (CC)", "CC"), ("London Cocoa (LCC)", "LCC"),
+                             ("Sugar (SB)", "SB"), ("Cotton (CT)", "CT")]:
+            _df = dfs[_key]
             if not _df.empty:
-                _latest = _df["date"].max().date().strftime("%d %b %Y")
-                st.caption(f"{_label} — {_latest}")
+                _latest = _df["date"].max().date()
+                _oi = latest_oi_date(_df)
+                note = "" if _oi == _latest else f" (OI to {_oi.strftime('%d %b')})" if _oi else " (no OI)"
+                st.caption(f"{_label} — {_latest.strftime('%d %b %Y')}{note}")
             else:
                 st.caption(f"{_label} — no data")
 
@@ -161,9 +224,22 @@ def _clean(pivot, month_keys):
     return pivot.apply(lambda c: pd.to_numeric(c, errors="coerce")).astype(float)
 
 def _valid(df, opt, new_date, min_oi):
+    """RICs passing the Min OI filter on New Date.
+
+    Falls back to the most recent prior date that carries OI when New Date has
+    none — otherwise a filter of any size would return an empty set and blank
+    out Volume/Px tables that have perfectly good data.
+    """
     if min_oi <= 0:
         return None
-    d2 = df[(df["date"].dt.date == new_date) & (df["option_type"] == opt)][["ric", "oi"]]
+    eff = new_date
+    day = df[(df["date"].dt.date == new_date) & (df["option_type"] == opt)]
+    if day.empty or not day["oi"].notna().any():
+        fb = latest_oi_date(df, on_or_before=new_date)
+        if fb is None:
+            return None  # no OI anywhere — don't filter rather than blank everything
+        eff = fb
+    d2 = df[(df["date"].dt.date == eff) & (df["option_type"] == opt)][["ric", "oi"]]
     return d2[pd.to_numeric(d2["oi"], errors="coerce") >= min_oi]["ric"]
 
 @st.cache_data(ttl=1800)
@@ -201,7 +277,9 @@ def get_vol_pivot(df, month_keys, opt, old_date, new_date, min_oi):
         sub = sub[sub["ric"].isin(v)]
     sub["mk"] = list(zip(sub["expiry_month"].astype(int), sub["expiry_year"].astype(int)))
     sub["volume"] = pd.to_numeric(sub["volume"], errors="coerce")
-    piv = sub.groupby(["strike", "mk"])["volume"].sum().unstack("mk")
+    # min_count=1 so a strike/expiry with no reported volume at all stays NaN
+    # (blank) instead of collapsing to a misleading 0.
+    piv = sub.groupby(["strike", "mk"])["volume"].sum(min_count=1).unstack("mk")
     return _clean(piv, month_keys).sort_index(ascending=False)
 
 def get_pct_pivot(df, month_keys, opt, old_date, new_date, min_oi):
@@ -271,6 +349,98 @@ def get_oi_snapshot_pivot(df, month_keys, opt, snap_date, new_date, min_oi):
     return _clean(piv, month_keys).sort_index(ascending=False)
 
 
+# ── Strike grid ────────────────────────────────────────────────────────────────
+def mround(value, multiple):
+    """Excel MROUND semantics — round half AWAY from zero.
+
+    Python's built-in round() is banker's rounding, which made the ATM centre
+    jump inconsistently: MROUND(375,50) gave 400 but MROUND(425,50) also gave
+    400, because 7.5 rounds up to 8 while 8.5 rounds down to 8.
+    """
+    if multiple is None or multiple <= 0:
+        return float(value)
+    q = float(value) / float(multiple)
+    return float(np.floor(q + 0.5) if q >= 0 else np.ceil(q - 0.5)) * float(multiple)
+
+
+def build_strike_grid(custom_atm, custom_step, strike_mode, all_strikes_data, n_side=25):
+    """Display strike rows, ascending.
+
+    Returns (rows, snap_tol):
+      Exact   -> real parquet strikes, n_side each side of the strike nearest
+                 ATM. snap_tol is None (exact index match). Step is ignored.
+      Nearest -> uniform ladder at custom_step, clamped to the traded strike
+                 range so we never render dozens of blank rows off the end of
+                 the board. snap_tol = step/2.
+    """
+    data = sorted(float(s) for s in all_strikes_data)
+    if not data:
+        return [], None
+
+    if strike_mode == "Exact":
+        arr = np.asarray(data, dtype=float)
+        j = int(np.abs(arr - custom_atm).argmin())
+        lo = max(0, j - n_side)
+        hi = min(len(arr), j + n_side + 1)
+        return [float(x) for x in arr[lo:hi]], None
+
+    step = float(custom_step) if custom_step and custom_step > 0 else 1.0
+    lo_d, hi_d = data[0], data[-1]
+    rows = []
+    for i in range(-n_side, n_side + 1):
+        r = round(custom_atm + i * step, 6)
+        # Clamp to the traded range (half a step of tolerance at each end) so
+        # the ladder covers the board rather than empty space beyond it.
+        if r > 0 and (lo_d - step / 2) <= r <= (hi_d + step / 2):
+            rows.append(r)
+    return rows, step / 2
+
+
+def project_to_grid(piv, rows, snap_tol, how="sum"):
+    """Reindex a strike-indexed pivot onto the display rows.
+
+    Maps *each data strike to its single nearest display row*, which makes
+    double-counting structurally impossible (the mapping is a function). When
+    several strikes land on one row they are combined per `how` rather than
+    silently dropped:
+        how="sum"     — additive quantities (OI, Volume)
+        how="nearest" — level quantities (price, %, IV): take the closest strike
+    """
+    rows = [float(r) for r in rows]
+    empty = pd.DataFrame(index=pd.Index(rows, name="strike"),
+                         columns=list(piv.columns) if piv is not None and not piv.empty else [],
+                         dtype=float)
+    if piv is None or piv.empty or not rows:
+        return empty
+
+    if snap_tol is None:
+        out = piv.reindex(rows)
+        out.index = pd.Index(rows, name="strike")
+        return out.astype(float)
+
+    src = np.asarray(piv.index, dtype=float)
+    tgt = np.asarray(rows, dtype=float)
+    nearest = np.abs(src[:, None] - tgt[None, :]).argmin(axis=1)
+    dist = np.abs(src - tgt[nearest])
+    keep = dist <= (snap_tol + 1e-9)
+    if not keep.any():
+        return empty
+
+    vals = piv.loc[keep].astype(float).copy()
+    grp = pd.Series(tgt[nearest[keep]], index=vals.index, name="__row")
+
+    if how == "sum":
+        out = vals.groupby(grp).sum(min_count=1)
+    else:
+        order = np.argsort(dist[keep], kind="stable")
+        vals = vals.iloc[order]
+        out = vals.groupby(grp.iloc[order]).first()
+
+    out = out.reindex(rows)
+    out.index = pd.Index(rows, name="strike")
+    return out.astype(float)
+
+
 # ── Colors ─────────────────────────────────────────────────────────────────────
 def _alpha(v, mx): return round(0.15 + min(abs(float(v)) / max(mx, 0.01), 1.0) * 0.50, 2)
 
@@ -324,29 +494,28 @@ _CSS = """<style>
 
 
 def butterfly_html(cpiv, ppiv, atm, cfn, month_keys, fmt="{:.0f}",
-                   footer=True, sfx="", title="", atm_tol=None, fixed_strikes=None,
-                   snap_tol=None):
+                   footer=True, sfx="", title="", strikes=None):
+    """Pure renderer — `cpiv`/`ppiv` must already be projected onto `strikes`
+    via project_to_grid(). No snapping happens here, so the footer total is
+    computed from exactly the cells on screen and always reconciles with them.
+    """
     ccols = list(reversed(month_keys))
     pcols = list(month_keys)
 
-    if fixed_strikes is not None:
-        strikes = list(fixed_strikes)  # caller controls order (asc = low at top, ATM centered)
-    else:
-        strikes_set = set()
-        if not cpiv.empty: strikes_set.update(cpiv.index.tolist())
-        if not ppiv.empty: strikes_set.update(ppiv.index.tolist())
-        strikes = sorted(strikes_set)  # low to high
+    if strikes is None:
+        s_set = set()
+        if cpiv is not None and not cpiv.empty: s_set.update(cpiv.index.tolist())
+        if ppiv is not None and not ppiv.empty: s_set.update(ppiv.index.tolist())
+        strikes = sorted(s_set)
+    strikes = [float(s) for s in strikes]
 
-    if atm_tol is None:
-        if len(strikes) >= 2:
-            gaps = [abs(strikes[i] - strikes[i+1]) for i in range(len(strikes)-1)]
-            atm_tol = min(gaps) * 0.6
-        else:
-            atm_tol = 1.0
+    if not strikes:
+        return ('<div style="padding:14px;color:#888;font-size:12px;'
+                'border:1px dashed #ddd;border-radius:4px">No strikes to display.</div>')
 
     def _flat(p):
-        if p.empty: return np.array([], dtype=float)
-        return p.values.astype(float).flatten()
+        if p is None or p.empty: return np.array([], dtype=float)
+        return p.to_numpy(dtype=float).flatten()
 
     av = np.concatenate([_flat(cpiv), _flat(ppiv)])
     av = av[~np.isnan(av)]
@@ -372,48 +541,47 @@ def butterfly_html(cpiv, ppiv, atm, cfn, month_keys, fmt="{:.0f}",
           + "".join(f'<th class="ph">{MONTH_NAMES[m]}</th>' for m, y in pcols)
           + '</tr>')
 
-    _piv_idx_cache = {}
-    def cv(piv, s, mk):
-        if piv.empty or mk not in piv.columns: return np.nan
-        # nearest-key lookup within snap_tol (tolerates display grid ≠ data grid)
-        if snap_tol is not None:
-            pid = id(piv)
-            if pid not in _piv_idx_cache:
-                _piv_idx_cache[pid] = np.array(piv.index.tolist(), dtype=float)
-            idx_arr = _piv_idx_cache[pid]
-            if len(idx_arr) == 0: return np.nan
-            diffs = np.abs(idx_arr - s)
-            if diffs.min() > snap_tol: return np.nan
-            s = idx_arr[diffs.argmin()]
-        elif s not in piv.index:
-            return np.nan
-        v = piv.at[s, mk]
-        return float(v) if not pd.isna(v) else np.nan
+    # Exactly one ATM row: the display row closest to the centre price. A
+    # tolerance test could match zero rows (ATM between strikes) or several.
+    atm_row = None
+    if atm is not None:
+        atm_row = min(range(len(strikes)), key=lambda i: abs(strikes[i] - atm))
+
+    def col_vals(piv, mk):
+        if piv is None or piv.empty or mk not in piv.columns:
+            return np.full(len(strikes), np.nan)
+        return piv[mk].to_numpy(dtype=float)
+
+    cmat = {mk: col_vals(cpiv, mk) for mk in ccols}
+    pmat = {mk: col_vals(ppiv, mk) for mk in pcols}
 
     def td(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return '<td></td>'
         style = cfn(v, mx)
-        txt = (fmt.format(v) + sfx) if not np.isnan(v) and v != 0 else ""
+        txt = (fmt.format(v) + sfx) if v != 0 else ""
         return f'<td style="{style}">{txt}</td>'
 
     body = []
-    for s in strikes:
-        is_atm = atm is not None and abs(s - atm) < atm_tol
+    for i, s in enumerate(strikes):
+        is_atm = (i == atm_row)
         sc     = "sc sc-atm" if is_atm else "sc"
         tr_cls = ' class="atm-row"' if is_atm else ""
-        lbl    = int(s) if s == int(s) else s
-        row = ("".join(td(cv(cpiv, s, mk)) for mk in ccols)
+        lbl    = int(s) if float(s).is_integer() else round(s, 4)
+        row = ("".join(td(cmat[mk][i]) for mk in ccols)
                + f'<td class="{sc}">{lbl}</td>'
-               + "".join(td(cv(ppiv, s, mk)) for mk in pcols))
+               + "".join(td(pmat[mk][i]) for mk in pcols))
         body.append(f"<tr{tr_cls}>{row}</tr>")
 
     ft = ""
     if footer:
-        def cs(piv, mk):
-            if piv.empty or mk not in piv.columns or piv[mk].notna().sum() == 0:
-                return float("nan")
-            return float(piv[mk].sum(skipna=True))
-        cft = "".join(td(cs(cpiv, mk)) for mk in ccols)
-        pft = "".join(td(cs(ppiv, mk)) for mk in pcols)
+        def cs(mat, mk):
+            col = mat[mk]
+            if np.all(np.isnan(col)):
+                return None
+            return float(np.nansum(col))
+        cft = "".join(td(cs(cmat, mk)) for mk in ccols)
+        pft = "".join(td(cs(pmat, mk)) for mk in pcols)
         ft = (f'<tfoot><tr>{cft}'
               f'<td class="sc" style="font-size:9px;color:#888">TOT</td>'
               f'{pft}</tr></tfoot>')
@@ -424,6 +592,14 @@ def butterfly_html(cpiv, ppiv, atm, cfn, month_keys, fmt="{:.0f}",
             f'{ft}<tbody>{"".join(body)}</tbody></table></div>')
 
 
+def render_butterfly(cpiv, ppiv, grid, atm, cfn, month_keys, how="sum", **kw):
+    """project_to_grid + butterfly_html in one call. `grid` is (rows, snap_tol)."""
+    rows, tol = grid
+    cp = project_to_grid(cpiv, rows, tol, how=how)
+    pp = project_to_grid(ppiv, rows, tol, how=how)
+    return butterfly_html(cp, pp, atm, cfn, month_keys, strikes=rows, **kw)
+
+
 # ── Misc helpers ───────────────────────────────────────────────────────────────
 def _tot(piv):
     # NaN, not 0.0, when the pivot has genuinely no data (e.g. OI is null
@@ -431,7 +607,7 @@ def _tot(piv):
     # behind Settle/Volume). piv.sum(skipna=True) alone silently turns an
     # all-NaN column into 0, which read as "no positioning change" in the
     # KPI row when the real answer is "no data yet for today".
-    if piv.empty or piv.notna().to_numpy().sum() == 0:
+    if piv is None or piv.empty or piv.notna().to_numpy().sum() == 0:
         return float("nan")
     return float(piv.sum(skipna=True).sum())
 
@@ -444,13 +620,19 @@ def _fn(v, f="{:,.0f}"):
     except Exception:
         return "—"
 
+def fmt_strike(x):
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    return f"{int(x)}" if x.is_integer() else f"{x:g}"
+
 # RIC reconstruction — LSEG scheme (interim migration), NOT the ICE
 # "<ROOT> <month><yy><C/P><strike>" scheme these were originally written
 # for. LSEG RICs are "1<ROOT><strike_encoded><month_code><yy>", with
 # A-L = Jan-Dec calls and M-X = Jan-Dec puts (see Code/_common.py /
-# Code/kc_ingest_lseg.py). Left as the ICE-style builders, this lookup
-# silently never matched our data's "ric" column, so every row's time
-# series panel showed "No data" — that's the bug being fixed here.
+# Code/kc_ingest_lseg.py). Verified 100% against every RIC in all six
+# parquets.
 def _ric_kc(strike, month, year, opt):
     code = CALL_CODES[month] if opt == "Call" else PUT_CODES[month]
     yy   = f"{year % 100:02d}"
@@ -486,131 +668,155 @@ def _ric_lcc(strike, month, year, opt):
     return f"LCC{int(round(strike))}{code}{yy}"
 
 
+# `mround_default` is the *display* centring multiple. It defaults to the
+# strike gap so the highlighted ATM row lands on a real strike: the previous
+# values (KC 50, CC 300) were the coarse ingest snap, which centred KC at 400
+# when the ATM was 375 and CC at 5700 when the ATM was 5750. The ingest snap
+# is still surfaced in the control's help text via `ingest_note`.
 COMMODITIES = [
     dict(key="KC",  title="KC",  tab_label="Arabica",     ric_fn=_ric_kc,
-         display_step=2.5, mround_default=50,
-         ingest_note="MRound=50 ¢/lb for ATM snap | Step=2.5 ¢/lb (kc_ingest_lseg.py STRIKE_GAP)",
+         display_step=2.5, mround_default=2.5,
+         ingest_note="Ingest ATM snap MRound=50 ¢/lb | Step=2.5 ¢/lb (kc_ingest_lseg.py STRIKE_GAP)",
          fut_name="kc",
-         atm_fmt=lambda v: f"{int(v) if v == int(v) else v}"),
+         atm_fmt=lambda v: f"{int(v) if float(v).is_integer() else v}"),
     dict(key="LRC", title="LRC", tab_label="Robusta",      ric_fn=_ric_lrc,
          display_step=25, mround_default=25,
-         ingest_note="MRound=25 $/tonne for ATM snap | Step=25 $/tonne | "
+         ingest_note="Ingest ATM snap MRound=25 $/tonne | Step=25 $/tonne | "
                       "active months Jan/Mar/May/Jul/Sep/Nov only (confirmed live vs LSEG)",
          fut_name="lrc",
          atm_fmt=lambda v: f"{int(v):,}"),
     dict(key="CC",  title="CC",  tab_label="NYC Cocoa",    ric_fn=_ric_cc,
-         display_step=50, mround_default=300,
-         ingest_note="MRound=300 $/mt for ATM snap | Step=50 $/mt (cc_ingest_lseg.py STRIKE_GAP)",
+         display_step=50, mround_default=50,
+         ingest_note="Ingest ATM snap MRound=300 $/mt | Step=50 $/mt (cc_ingest_lseg.py STRIKE_GAP)",
          fut_name="cc",
          atm_fmt=lambda v: f"{int(v):,}"),
     dict(key="LCC", title="LCC", tab_label="London Cocoa", ric_fn=_ric_lcc,
          display_step=25, mround_default=25,
-         ingest_note="MRound=25 for ATM snap | Step=25 | "
+         ingest_note="Ingest ATM snap MRound=25 | Step=25 | "
                       "active months Mar/May/Jul/Sep/Dec only (confirmed live vs LSEG)",
          fut_name="lcc",
          atm_fmt=lambda v: f"{int(v):,}"),
     dict(key="SB",  title="SB",  tab_label="Sugar (SB)",   ric_fn=_ric_sb,
          display_step=0.25, mround_default=0.25,
-         ingest_note="MRound=0.25 cts/lb for ATM snap | Step=0.25 cts/lb (sb_ingest_lseg.py STRIKE_GAP)",
+         ingest_note="Ingest ATM snap MRound=0.25 cts/lb | Step=0.25 cts/lb (sb_ingest_lseg.py STRIKE_GAP)",
          fut_name="sb",
          atm_fmt=lambda v: f"{v:.2f}"),
     dict(key="CT",  title="CT",  tab_label="Cotton",       ric_fn=_ric_ct,
          display_step=1, mround_default=1,
-         ingest_note="MRound=1 cts/lb for ATM snap | Step=1 cts/lb (ct_ingest_lseg.py STRIKE_GAP)",
+         ingest_note="Ingest ATM snap MRound=1 cts/lb | Step=1 cts/lb (ct_ingest_lseg.py STRIKE_GAP)",
          fut_name="ct",
          atm_fmt=lambda v: f"{int(v)}"),
 ]
 
 
+def oi_notice(df, new_date, key):
+    """Warn when the chosen New Date carries no OI (LSEG publishes it a day late)."""
+    day = df[df["date"].dt.date == new_date]
+    if day.empty or day["oi"].notna().any():
+        return
+    fb = latest_oi_date(df, on_or_before=new_date)
+    if fb:
+        st.warning(
+            f"No Open Interest published for {key} on {new_date.strftime('%d %b %Y')} "
+            f"— LSEG releases OI one session behind Settle/Volume. "
+            f"OI Change will be blank; latest OI is **{fb.strftime('%d %b %Y')}**. "
+            f"Pick that as New Date to see positioning. Volume and price are unaffected."
+        )
+    else:
+        st.warning(f"No Open Interest data available for {key}.")
+
+
 def render_controls(df, atm_val, atm_label, atm_data, key_prefix, title,
                     display_step=None, mround_default=None, ingest_note=""):
-    """Renders the shared Controls expander (Min OI / Price / MRound / Step / Mode).
-    Returns (min_oi, custom_atm, custom_step, strike_mode, month_keys, all_strikes_data)."""
+    """Renders the shared Controls expander. Returns a dict of resolved settings."""
     month_keys       = _month_keys(df)
-    all_strikes_data = sorted(df["strike"].unique())  # ascending, for step inference
+    all_strikes_data = sorted(df["strike"].unique())
     atm_updated      = atm_data.get("updated", "—")
 
-    if atm_val is not None and len(all_strikes_data) > 1:
-        if display_step is not None:
-            step = display_step
-        else:
-            diffs = [all_strikes_data[i+1] - all_strikes_data[i]
-                     for i in range(len(all_strikes_data)-1)]
-            step = sorted(diffs)[len(diffs)//2]
+    # Median traded gap — the honest default step for this board.
+    if len(all_strikes_data) > 1:
+        diffs = np.diff(np.asarray(all_strikes_data, dtype=float))
+        native_gap = float(np.median(diffs))
     else:
-        step = 1.0
+        native_gap = 1.0
 
-    _def_step   = float(display_step if display_step else (step if atm_val is not None and len(all_strikes_data) > 1 else 1.0))
+    _def_step   = float(display_step if display_step else native_gap)
     _def_mround = float(mround_default if mround_default is not None else _def_step)
 
     with st.expander("Controls", expanded=False):
-        col_oi, col_price, col_mround, col_step, col_mode = st.columns([1, 1.2, 0.8, 0.8, 1.4])
-        with col_oi:
-            min_oi = st.number_input("Min OI filter (New Date)", value=0, min_value=0,
-                                      step=10, key=f"{key_prefix}_min_oi",
-                                      help="Hide strikes where Open Interest on the New Date is below this threshold.")
-        with col_price:
+        c_oi, c_price, c_mround, c_mode, c_step, c_rows = st.columns([1, 1.1, 0.8, 1.2, 0.8, 0.8])
+
+        with c_oi:
+            min_oi = st.number_input(
+                "Min OI filter (New Date)", value=0, min_value=0, step=10,
+                key=f"{key_prefix}_min_oi",
+                help="Hide strikes whose Open Interest on the New Date is below this. "
+                     "If OI is not yet published for the New Date, the most recent "
+                     "date that has OI is used instead.")
+        with c_price:
             raw_price = st.number_input(
                 "Price", value=float(atm_val) if atm_val is not None else 0.0,
                 format="%.2f", key=f"{key_prefix}_raw_price",
-                help="Raw market price (e.g. last futures settle). The table centers on MROUND(Price, MRound)."
-            )
-        with col_mround:
+                help="Raw market price (e.g. last futures settle). "
+                     "The table centres on MROUND(Price, MRound).")
+        with c_mround:
             mround_val = st.number_input(
-                "MRound", value=_def_mround, min_value=0.01,
-                format="%.2f", key=f"{key_prefix}_mround",
-                help=(
-                    "Rounding multiple for the ATM. Center ATM = nearest multiple of this value to Price "
-                    "(e.g. Price=302.5, MRound=50 → ATM=300).\n\n"
-                    + (f"Ingest uses: {ingest_note}" if ingest_note else "")
-                )
-            )
-        with col_step:
-            custom_step = st.number_input(
-                "Step", value=_def_step, min_value=0.01,
-                format="%.2f", key=f"{key_prefix}_custom_step",
-                help=(
-                    "Strike ladder increment — gap between rows in the table.\n\n"
-                    + (f"Ingest uses: {ingest_note}" if ingest_note else "")
-                )
-            )
-        with col_mode:
+                "MRound", value=_def_mround, min_value=0.0001, format="%.4f",
+                key=f"{key_prefix}_mround",
+                help="Centring multiple for the ATM row: ATM = nearest multiple of "
+                     "this to Price (Excel MROUND, half away from zero). Defaults to "
+                     "the strike gap so the ATM lands on a real strike.\n\n"
+                     + (ingest_note or ""))
+        with c_mode:
             strike_mode = st.radio(
-                "Strike mode", ["Exact", "Nearest"],
-                index=0, horizontal=True,
+                "Strike mode", ["Exact", "Nearest"], index=0, horizontal=True,
                 key=f"{key_prefix}_strike_mode",
-                help=(
-                    "Nearest: grid rows at exact step intervals, data pulled from the "
-                    "closest parquet strike within Step/2 — clean uniform ladder.\n\n"
-                    "Exact: rows are the actual strikes from the parquet, centered "
-                    "on ATM — no interpolation, raw exchange data only."
-                )
-            )
+                help="Exact: rows are the real traded strikes from the parquet, "
+                     "centred on ATM. Nothing is interpolated or merged, and Step "
+                     "does not apply.\n\n"
+                     "Nearest: a uniform ladder at Step intervals, clamped to the "
+                     "traded range, with each strike snapped to its nearest row "
+                     "(within Step/2).")
+        with c_step:
+            step_disabled = (strike_mode == "Exact")
+            custom_step = st.number_input(
+                "Step", value=_def_step, min_value=0.0001, format="%.4f",
+                key=f"{key_prefix}_custom_step", disabled=step_disabled,
+                help=("Not used in Exact mode — rows come straight from the traded "
+                      "strikes. Switch to Nearest to build a uniform ladder."
+                      if step_disabled else
+                      f"Ladder increment between rows. Traded gap for {title} is "
+                      f"{fmt_strike(native_gap)}."))
+        with c_rows:
+            n_side = st.number_input(
+                "Rows ±", value=25, min_value=3, max_value=80, step=1,
+                key=f"{key_prefix}_n_side",
+                help="How many strike rows to show either side of the ATM.")
 
-        custom_atm = round(raw_price / mround_val) * mround_val if mround_val > 0 else raw_price
-        st.caption(
-            f"Center ATM: **{custom_atm:,.2f}** = MROUND({raw_price:,.2f}, {mround_val:,.2f})  |  "
-            f"ATM ({title}): **{atm_label}** as of {atm_updated}  |  "
-            f"Data: {df['date'].min().date()} to {df['date'].max().date()}"
-        )
+        custom_atm = mround(raw_price, mround_val)
 
-    return min_oi, custom_atm, custom_step, strike_mode, month_keys, all_strikes_data
+        rows, snap_tol = build_strike_grid(custom_atm, custom_step, strike_mode,
+                                           all_strikes_data, n_side=int(n_side))
 
+        bits = [
+            f"Centre ATM: **{custom_atm:,.4g}** = MROUND({raw_price:,.4g}, {mround_val:,.4g})",
+            f"ATM ({title}): **{atm_label}** as of {atm_updated}",
+            f"Rows: **{len(rows)}**"
+            + (f" (traded strikes {fmt_strike(rows[0])}–{fmt_strike(rows[-1])})" if rows else ""),
+            f"Traded gap: **{fmt_strike(native_gap)}**",
+            f"Data: {df['date'].min().date()} to {df['date'].max().date()}",
+        ]
+        st.caption("  |  ".join(bits))
+        if strike_mode == "Exact":
+            st.caption("Exact mode — Step is disabled; every row is a real traded strike.")
+        elif abs(custom_step - native_gap) > 1e-9:
+            st.caption(
+                f"Step {fmt_strike(custom_step)} differs from the traded gap "
+                f"{fmt_strike(native_gap)} — strikes landing on the same row are "
+                f"combined (summed for OI/Volume) so nothing is dropped, but rows "
+                f"no longer map 1:1 to exchange strikes.")
 
-def build_strike_grid(custom_atm, custom_step, strike_mode, all_strikes_data, N=35):
-    """Returns (all_strikes, snap_tol) for the display grid."""
-    if strike_mode == "Nearest":
-        all_strikes = [round(custom_atm + i * custom_step, 6)
-                       for i in range(-N, N+1)
-                       if custom_atm + i * custom_step > 0]
-        snap_tol = custom_step / 2
-    else:
-        snap = {}
-        for s in all_strikes_data:
-            bucket = round((s - custom_atm) / custom_step)
-            if bucket not in snap or abs(s - custom_atm) < abs(snap[bucket] - custom_atm):
-                snap[bucket] = s
-        all_strikes = sorted([snap[b] for b in range(-N, N+1) if b in snap])
-        snap_tol = None
-
-    return all_strikes, snap_tol
+    return dict(min_oi=int(min_oi), custom_atm=custom_atm, custom_step=float(custom_step),
+                strike_mode=strike_mode, month_keys=month_keys,
+                all_strikes_data=all_strikes_data, grid=(rows, snap_tol),
+                n_side=int(n_side), native_gap=native_gap)

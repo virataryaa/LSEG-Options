@@ -32,11 +32,14 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
         st.info(f"No data available for {title}.")
         return
 
-    min_oi, custom_atm, custom_step, strike_mode, month_keys, all_strikes_data = c.render_controls(
+    cfg = c.render_controls(
         df, atm_val, atm_label, atm_data, key_prefix, title,
         display_step=display_step, mround_default=mround_default, ingest_note=ingest_note,
     )
-    all_strikes, snap_tol = c.build_strike_grid(custom_atm, custom_step, strike_mode, all_strikes_data)
+    min_oi     = cfg["min_oi"]
+    custom_atm = cfg["custom_atm"]
+    month_keys = cfg["month_keys"]
+    grid       = cfg["grid"]
 
     has_iv = "impvol" in df.columns and df["impvol"].notna().any()
     has_fut = fut_df is not None and not fut_df.empty
@@ -60,16 +63,14 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
         with pc1:
             st.markdown("**Px Change**")
             st.markdown(
-                c.butterfly_html(call_px, put_px, custom_atm, c.px_color, month_keys,
-                               fmt="{:.2f}", footer=False, title=title,
-                               fixed_strikes=all_strikes, snap_tol=snap_tol),
+                c.render_butterfly(call_px, put_px, grid, custom_atm, c.px_color, month_keys,
+                                   how="nearest", fmt="{:.2f}", footer=False, title=title),
                 unsafe_allow_html=True)
         with pc2:
             st.markdown("**% Change**")
             st.markdown(
-                c.butterfly_html(call_pct, put_pct, custom_atm, c.px_color, month_keys,
-                               fmt="{:.1f}", footer=False, sfx="%", title=title,
-                               fixed_strikes=all_strikes, snap_tol=snap_tol),
+                c.render_butterfly(call_pct, put_pct, grid, custom_atm, c.px_color, month_keys,
+                                   how="nearest", fmt="{:.1f}", footer=False, sfx="%", title=title),
                 unsafe_allow_html=True)
 
     if inner_vs is not None:
@@ -84,16 +85,15 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
             with vc1:
                 st.markdown(f"**ImpVol Snapshot — {new_date.strftime('%d %b %Y')}**")
                 st.markdown(
-                    c.butterfly_html(call_iv, put_iv, custom_atm, c.iv_color, month_keys,
-                                   fmt="{:.1f}", sfx="%", footer=False, title=title,
-                                   fixed_strikes=all_strikes, snap_tol=snap_tol),
+                    c.render_butterfly(call_iv, put_iv, grid, custom_atm, c.iv_color, month_keys,
+                                       how="nearest", fmt="{:.1f}", sfx="%", footer=False, title=title),
                     unsafe_allow_html=True)
             with vc2:
                 st.markdown(f"**IV Change — {old_date.strftime('%d %b %Y')} → {new_date.strftime('%d %b %Y')}**")
                 st.markdown(
-                    c.butterfly_html(call_iv_chg, put_iv_chg, custom_atm, c.iv_chg_color, month_keys,
-                                   fmt="{:+.1f}", sfx="%", footer=False, title=title,
-                                   fixed_strikes=all_strikes, snap_tol=snap_tol),
+                    c.render_butterfly(call_iv_chg, put_iv_chg, grid, custom_atm, c.iv_chg_color,
+                                       month_keys, how="nearest", fmt="{:+.1f}", sfx="%",
+                                       footer=False, title=title),
                     unsafe_allow_html=True)
 
             st.divider()
@@ -147,7 +147,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                             legend=dict(orientation="h", y=1.1),
                             plot_bgcolor="#fafafa", paper_bgcolor="#fafafa"
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
                     else:
                         st.info("No ImpVol data for selected expiry on this date.")
 
@@ -298,7 +298,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                         plot_bgcolor="#fafafa", paper_bgcolor="#fafafa",
                         barmode="overlay"
                     )
-                    st.plotly_chart(fig_sn, use_container_width=True)
+                    st.plotly_chart(fig_sn, width="stretch")
                     st.caption(
                         "Call IV and Put IV each use the nearest strike to the anchor "
                         "price that actually has a live reading — the two can differ "
@@ -388,7 +388,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                             legend=dict(orientation="h", y=-0.2),
                             plot_bgcolor="#fafafa", paper_bgcolor="#fafafa"
                         )
-                        st.plotly_chart(fig_ts, use_container_width=True)
+                        st.plotly_chart(fig_ts, width="stretch")
                         src = "per-expiry futures settlement" if fut_df is not None and not fut_df.empty else "ATM snap (futures unavailable)"
                         st.caption(f"ATM anchored to {src} for each expiry — serial months mapped to next available futures contract.")
                 else:
@@ -509,7 +509,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                             legend=dict(orientation="h", y=-0.25),
                             plot_bgcolor="#fafafa", paper_bgcolor="#fafafa"
                         )
-                        st.plotly_chart(fig_rv, use_container_width=True)
+                        st.plotly_chart(fig_rv, width="stretch")
                         st.caption(
                             f"Solid = ATM implied vol per expiry. Dotted = {rv_window}-day realized vol "
                             "(annualized, from daily log returns) of the underlying futures contract each "
