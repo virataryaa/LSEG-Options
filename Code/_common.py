@@ -202,16 +202,28 @@ def get_atm_strike(ld, atm_ric: str, strike_gap: float, atm_field: str = "TRDPRC
     TRDPRC_1 can also go null off-hours for KC/CC/SB/CT (seen live on CC,
     2026-08-25 — a run that otherwise succeeded for KC/SB/CT the same
     morning), so falls back to SETTLE rather than crashing when that
-    happens, instead of only ever relying on the caller's chosen field."""
-    df = ld.get_data(universe=[atm_ric], fields=[atm_field])
-    price = df[atm_field].iloc[0]
-    if pd.isna(price) and atm_field != "SETTLE":
-        df = ld.get_data(universe=[atm_ric], fields=["SETTLE"])
-        price = df["SETTLE"].iloc[0]
-    if pd.isna(price):
-        raise ValueError(f"{atm_ric}: both {atm_field} and SETTLE came back null — no ATM price available.")
-    price = float(price)
-    return round(round(price / strike_gap) * strike_gap, 2)
+    happens, instead of only ever relying on the caller's chosen field.
+
+    This is also the first call of a run, so it RETRIES: an unretried timeout
+    here aborts the whole ingest before a single row is fetched (observed on
+    KC, 2026-08-26, when the local Workspace proxy was briefly unresponsive).
+    """
+    fields = [atm_field] if atm_field == "SETTLE" else [atm_field, "SETTLE"]
+    delay, last = FETCH_BACKOFF, None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        for field in fields:
+            try:
+                df = ld.get_data(universe=[atm_ric], fields=[field])
+                price = df[field].iloc[0]
+                if not pd.isna(price):
+                    return round(round(float(price) / strike_gap) * strike_gap, 2)
+            except Exception as e:
+                last = e
+        if attempt < FETCH_RETRIES:
+            time.sleep(delay)
+            delay *= 2
+    raise ValueError(f"{atm_ric}: no ATM price from {fields} after {FETCH_RETRIES} attempts "
+                     f"({str(last)[:120] if last else 'all null'})")
 
 
 def build_strikes(atm: float, strike_gap: float, strike_steps: int) -> list:

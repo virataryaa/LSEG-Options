@@ -105,6 +105,19 @@ BATCH_SIZE     = 50
 PREFILTER_SIZE = 100
 FETCH_RETRIES  = 3             # transient LSEG timeouts are common on wide universes
 FETCH_BACKOFF  = 5             # seconds, doubled per retry
+ACTIVE_LOOKBACK = 10           # days of OI/volume history that make a RIC "active"
+
+# Measured cost model (2026-08-26). lseg.data does NOT batch get_history: it
+# issues one HTTP request per RIC to the local Workspace proxy, so wall time is
+# linear in RIC COUNT and almost independent of everything else.
+#   batch size 50 / 100 / 200 over 400 RICs -> 82.7s / 82.8s / 83.0s  (no effect)
+#   window 10d vs 90d at 400 RICs           -> 83.4s / 83.7s          (payload ~free)
+#   400 RICs -> 83s  =>  0.2075 s/RIC; 1,730 RICs predicted 359s, measured 358s
+#   concurrency (2 and 4 threads)           -> read timeouts, batches failed
+# So neither bigger batches, shorter windows nor threading help. The only lever
+# is fetching fewer RICs — which is what --active-only does. Corollary: because
+# payload is nearly free, a full sweep should use a LONG window rather than a
+# short one, since the extra history costs almost nothing.
 FIELDS         = ["SETTLE", "OPINT_1", "ACVOL_UNS", "IMP_VOLT"]
 
 SEARCH_PREFIX  = f"1{COMMODITY}"
@@ -130,9 +143,32 @@ today = pd.Timestamp.today().normalize()
 # ── Universe construction ────────────────────────────────────────────────────
 
 def get_atm_strike(ld) -> float:
-    df = ld.get_data(universe=[ATM_RIC], fields=["TRDPRC_1"])
-    price = float(df["TRDPRC_1"].iloc[0])
-    return round(round(price / STRIKE_GAP) * STRIKE_GAP, 2)
+    """Front-month price snapped to the strike grid.
+
+    Retries, and falls back to SETTLE, because this is the first call of the
+    run: an unretried timeout here aborts the whole ingest before a single row
+    is fetched (observed 2026-08-26). TRDPRC_1 also goes null off-hours, which
+    the sibling _common.get_atm_strike already guards against.
+    """
+    delay = FETCH_BACKOFF
+    last = None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        for field in ("TRDPRC_1", "SETTLE"):
+            try:
+                df = ld.get_data(universe=[ATM_RIC], fields=[field])
+                price = df[field].iloc[0]
+                if not pd.isna(price):
+                    if field != "TRDPRC_1":
+                        log.info("ATM from %s (TRDPRC_1 unavailable)", field)
+                    return round(round(float(price) / STRIKE_GAP) * STRIKE_GAP, 2)
+            except Exception as e:
+                last = e
+        if attempt < FETCH_RETRIES:
+            log.warning("ATM fetch failed (attempt %d/%d): %s — retrying in %ds",
+                        attempt, FETCH_RETRIES, str(last)[:100], delay)
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError(f"{ATM_RIC}: no ATM price after {FETCH_RETRIES} attempts ({str(last)[:120]})")
 
 
 def build_strikes(atm: float) -> list:
@@ -373,6 +409,10 @@ def main():
                         help="Also ingest weekly/serial options (collide with monthlies on (strike,month,year))")
     parser.add_argument("--require-oi", action="store_true",
                         help="Prefilter to OI>0 only (old behaviour); default also keeps settle-quoted strikes")
+    parser.add_argument("--active-only", action="store_true",
+                        help="Fetch only RICs that carried OI or volume recently (see ACTIVE_LOOKBACK). "
+                             "Cuts a daily run from ~6min to ~1.7min; the settle-only wings then refresh "
+                             "on whatever cadence you run the full sweep.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report universe and coverage, then exit without writing the parquet")
     args = parser.parse_args()
@@ -417,6 +457,35 @@ def main():
         t0 = time.time()
         live_rics = prefilter_live(ld, all_rics, require_oi=args.require_oi)
         log.info("Quoted RICs: %d / %d (%.0fs)", len(live_rics), len(all_rics), time.time() - t0)
+
+        skipped_rics = []
+        if args.active_only and PARQUET_PATH.exists():
+            # Wall time is linear in RIC count (see the cost model above), so the
+            # only way to make a daily run faster is to ask for fewer RICs. Keep
+            # the ones that actually traded or held OI recently; the rest are
+            # settle-only wings that carry no positioning and can refresh on the
+            # full sweep instead.
+            prev = pd.read_parquet(PARQUET_PATH)
+            prev["date"] = pd.to_datetime(prev["date"])
+            recent = prev[prev["date"] >= prev["date"].max() - pd.Timedelta(days=ACTIVE_LOOKBACK)]
+            active = set(recent[pd.to_numeric(recent["oi"], errors="coerce") > 0]["ric"]) | \
+                     set(recent[pd.to_numeric(recent["volume"], errors="coerce") > 0]["ric"])
+            # anything newly listed has no history yet — always include it
+            newly = set(live_rics) - set(prev["ric"])
+            trimmed = [r for r in live_rics if r in active or r in newly]
+            if trimmed:
+                log.info("ACTIVE-ONLY: %d of %d RICs traded or held OI in the last %dd "
+                         "(+%d newly listed) — est. %.0fs instead of %.0fs",
+                         len(trimmed), len(live_rics), ACTIVE_LOOKBACK, len(newly),
+                         len(trimmed) * 0.2075, len(live_rics) * 0.2075)
+                # The RICs we are choosing NOT to fetch must be protected exactly
+                # like a failed batch: the incremental upsert clears the refresh
+                # window before writing, so without this their recent rows would
+                # be deleted rather than left alone.
+                skipped_rics = [r for r in live_rics if r not in set(trimmed)]
+                live_rics = trimmed
+            else:
+                log.warning("ACTIVE-ONLY matched nothing — falling back to the full quoted set.")
 
         if not live_rics:
             log.error("No live RICs found — aborting without touching the parquet.")
@@ -490,9 +559,10 @@ def main():
                 # Keep rows outside the refresh window, plus every row belonging to
                 # a RIC whose batch could not be fetched — otherwise a transient
                 # timeout deletes that RIC's window instead of leaving it alone.
+                protect = set(failed_rics) | set(skipped_rics)
                 keep = existing["date"] < window_start
-                if failed_rics:
-                    keep = keep | existing["ric"].isin(set(failed_rics))
+                if protect:
+                    keep = keep | existing["ric"].isin(protect)
                 base = existing[keep]
             final = (pd.concat([base, new_data], ignore_index=True)
                       .drop_duplicates(subset=["date", "ric"], keep="last")
