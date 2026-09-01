@@ -35,7 +35,7 @@ ATM_JSON = ROOT / "Dashboard" / "atm.json"
 # Dashboard's per-expiry ATM anchor (Vol Term Structure panel). Source
 # uses "rc" for Robusta; Options RICs use "LRC", so that one is renamed
 # on copy — everything else copies straight across.
-FUTURES_SRC = Path(r"C:\Users\virat.arya\ETG\SoftsDatabase - Documents\Database\Hardmine\Interim_Migration\Futures\Database")
+FUTURES_SRC = Path(r"C:\Users\virat.arya\ETG\SoftsDatabase - Documents\Database\Hardmine\LSEG\Futures\Database")
 FUTURES_DST = ROOT / "Database" / "Futures"
 FUTURES_MAP = {
     "kc_futures.parquet":  "kc_futures.parquet",
@@ -149,7 +149,7 @@ def main():
     body_parts.append(f"Git: {'pushed' if pushed else 'nothing new / failed'}\n{git_out.strip()}")
     body = "\n".join(body_parts)
 
-    subject = f"[Interim_Migration Options] {'PARTIAL FAIL' if any_failed else 'OK'} {today}"
+    subject = f"[LSEG Options] {'PARTIAL FAIL' if any_failed else 'OK'} {today}"
     send_email(subject, body)
     log("Done.")
 
@@ -163,5 +163,5 @@ if __name__ == "__main__":
     except Exception:
         msg = traceback.format_exc()
         log(f"UNHANDLED ERROR:\n{msg}")
-        send_email(f"[Interim_Migration Options] CRASHED {datetime.date.today()}", msg)
+        send_email(f"[LSEG Options] CRASHED {datetime.date.today()}", msg)
         sys.exit(1)
