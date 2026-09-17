@@ -54,6 +54,7 @@ SEARCH_TOP     = 10000
 PREFILTER_SIZE = 100
 FETCH_RETRIES  = 3   # transient LSEG timeouts/429s are common on wide universes
 FETCH_BACKOFF  = 5   # seconds, doubled per retry
+ACTIVE_LOOKBACK = 10 # days of OI/volume history that make a RIC "active" (--active-only)
 
 # Secondary guard so a RIC prefix cannot drag in an unrelated instrument
 # (e.g. startswith '1CC' also matches non-cocoa tickers).
@@ -459,7 +460,7 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
                 ric_prefix: str = "1", allowed_months: set = None, atm_field: str = "TRDPRC_1",
                 use_discovery: bool = True, include_weeklies: bool = False,
                 require_oi: bool = False, dry_run: bool = False, days: int = None,
-                no_topup: bool = False, exchange_code: str = None):
+                no_topup: bool = False, exchange_code: str = None, active_only: bool = False):
     """Shared main-loop body. Returns the final DataFrame written to parquet.
     ric_prefix: '1' for KC/CC/SB/CT-style RICs, '' for LRC/LCC (root is already
     unambiguous, no disambiguator prefix — confirmed live via discovery.search).
@@ -505,6 +506,32 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
         live_rics = prefilter_live(ld, all_rics, log, require_oi=require_oi)
         log.info("Quoted RICs: %d / %d (%.0fs)", len(live_rics), len(all_rics), time.time() - t0)
 
+        # Ported from kc_ingest_lseg.py, same logic: wall time is linear in RIC
+        # count, so the only way to shrink a daily run is to fetch fewer RICs.
+        # Keep only RICs that traded or held OI recently; the rest are
+        # settle-only wings that carry no positioning and can refresh on
+        # whatever cadence a full (non-active-only) sweep runs instead.
+        skipped_rics = []
+        if active_only and parquet_path.exists():
+            prev = pd.read_parquet(parquet_path)
+            prev["date"] = pd.to_datetime(prev["date"])
+            recent = prev[prev["date"] >= prev["date"].max() - pd.Timedelta(days=ACTIVE_LOOKBACK)]
+            active = set(recent[pd.to_numeric(recent["oi"], errors="coerce") > 0]["ric"]) | \
+                     set(recent[pd.to_numeric(recent["volume"], errors="coerce") > 0]["ric"])
+            newly = set(live_rics) - set(prev["ric"])  # never-seen RICs have no history to judge by
+            trimmed = [r for r in live_rics if r in active or r in newly]
+            if trimmed:
+                log.info("ACTIVE-ONLY: %d of %d RICs traded or held OI in the last %dd (+%d newly listed)",
+                         len(trimmed), len(live_rics), ACTIVE_LOOKBACK, len(newly))
+                # RICs we choose NOT to fetch must be protected exactly like a
+                # failed batch: the incremental upsert clears the refresh
+                # window before writing, so without this their recent rows
+                # would be deleted rather than left alone.
+                skipped_rics = [r for r in live_rics if r not in set(trimmed)]
+                live_rics = trimmed
+            else:
+                log.warning("ACTIVE-ONLY matched nothing — falling back to the full quoted set.")
+
         if not live_rics:
             log.error("No live RICs found — aborting without touching the parquet.")
             sys.exit(1)
@@ -523,7 +550,7 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
             log.info("DRY RUN — nothing written.")
             return None
 
-        all_dfs, failed_rics = [], []
+        all_dfs, failed_rics, partial_rics = [], [], []
         n_batches = (len(live_rics) + batch_size - 1) // batch_size
         t0 = time.time()
         for i in range(0, len(live_rics), batch_size):
@@ -532,7 +559,18 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
             df, definitive = fetch_batch(ld, batch, fetch_start, fetch_end, log)
             if not df.empty:
                 all_dfs.append(df)
-                log.info("  batch %d/%d: %d rows (%d RICs with data)", b_num, n_batches, len(df), df["ric"].nunique())
+                # A batch can succeed while silently returning fewer RICs than
+                # asked for. Those RICs are not "failed", so without this they
+                # fall through to the upsert, which clears the refresh window
+                # and has nothing to write back — deleting their recent
+                # history (same fix as kc_ingest_lseg.py; observed on CT/SB
+                # 2026-09-15, where lost rows had to be re-backfilled later).
+                missing = [r for r in batch if r not in set(df["ric"].unique())]
+                if missing:
+                    partial_rics.extend(missing)
+                log.info("  batch %d/%d: %d rows (%d/%d RICs with data%s)", b_num, n_batches,
+                         len(df), df["ric"].nunique(), len(batch),
+                         f", {len(missing)} not returned — preserved" if missing else "")
             elif definitive:
                 log.info("  batch %d/%d: no data", b_num, n_batches)
             else:
@@ -543,6 +581,9 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
         if failed_rics:
             log.warning("%d RICs could not be fetched this run; their history is kept as-is.",
                         len(failed_rics))
+        if partial_rics:
+            log.warning("%d RICs were requested but not returned by an otherwise-successful batch; "
+                        "their existing rows are preserved rather than cleared.", len(partial_rics))
 
         if not all_dfs:
             log.error("No data returned from any batch.")
@@ -576,8 +617,9 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
                 # transient failure deletes that RIC's window instead of
                 # leaving it alone.
                 keep = existing["date"] < window_start
-                if failed_rics:
-                    keep = keep | existing["ric"].isin(set(failed_rics))
+                protect = set(failed_rics) | set(skipped_rics) | set(partial_rics)
+                if protect:
+                    keep = keep | existing["ric"].isin(protect)
                 base = existing[keep]
             final = (pd.concat([base, new_data], ignore_index=True)
                       .drop_duplicates(subset=["date", "ric"], keep="last")

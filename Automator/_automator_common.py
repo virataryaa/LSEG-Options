@@ -42,6 +42,16 @@ ALL_COMMODITIES = {
 }
 COOLDOWN_SECONDS = 60  # pause between commodities in a group to let the rate-limit window reset
 
+# Single toggle for the whole daily automation. When True, every commodity's
+# daily run passes --active-only (skip RICs with no OI/volume in the last 10
+# days — cuts KC's run from ~6min to ~1.7min by fetching far fewer RICs,
+# which directly reduces exposure to LSEG's rate limit). Settle-only wings
+# then only refresh whenever a --full sweep is run by hand.
+#
+# FALLBACK: flip this back to False to instantly return every daily run to
+# the full quoted-universe fetch, no other changes needed anywhere.
+ACTIVE_ONLY_DAILY = True
+
 FUTURES_SRC = Path(r"C:\Users\virat.arya\ETG\SoftsDatabase - Documents\Database\Hardmine\LSEG\Futures\Database")
 FUTURES_DST = DB_DIR / "Futures"
 FUTURES_MAP = {
@@ -91,7 +101,7 @@ def sync_futures() -> tuple[bool, str]:
     return ok, "\n".join(lines)
 
 
-def run_ingest(script: Path, label: str) -> tuple[bool, str]:
+def run_ingest(script: Path, label: str, extra_args: list[str] = None) -> tuple[bool, str]:
     """Runs one commodity's ingest, streaming its output live to the cmd.exe
     window as it happens (batch N/34, OI top-up, etc. — all already logged
     inside the ingest scripts, just never visible before). The old
@@ -101,8 +111,9 @@ def run_ingest(script: Path, label: str) -> tuple[bool, str]:
     """
     log(f"Running {label} ingest...")
     lines = []
+    cmd = [PYTHON, str(script)] + (extra_args or [])
     proc = subprocess.Popen(
-        [PYTHON, str(script)],
+        cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1,
     )
@@ -275,7 +286,8 @@ def run_group(group_label: str, commodity_keys: list[str]):
             log(f"Cooldown {COOLDOWN_SECONDS}s before {key}...")
             time.sleep(COOLDOWN_SECONDS)
         log(f"[{idx + 1}/{n}] {key} starting...")
-        ok, out = run_ingest(script, key)
+        extra = ["--active-only"] if ACTIVE_ONLY_DAILY else []
+        ok, out = run_ingest(script, key, extra_args=extra)
         results[key] = (ok, out)
         log(f"[{idx + 1}/{n}] {key} ingest: {'OK' if ok else 'FAILED'}")
         if not ok:

@@ -72,6 +72,10 @@ def main():
                         help="Report universe and coverage, then exit without writing the parquet")
     parser.add_argument("--no-topup", action="store_true",
                         help="Skip the post-save real-time-quote OI top-up for the prior session")
+    parser.add_argument("--active-only", action="store_true",
+                        help="Fetch only RICs that carried OI or volume in the last 10 days. "
+                             "Cuts the run's RIC count (and rate-limit exposure); settle-only "
+                             "wings then refresh whenever you run a full (non-active-only) sweep.")
     args = parser.parse_args()
 
     log = c.make_logger("lrc_ingest_lseg", Path(__file__).parent / "logs")
@@ -85,7 +89,7 @@ def main():
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, ric_prefix=RIC_PREFIX,
         allowed_months=ALLOWED_MONTHS, atm_field=ATM_FIELD, no_topup=args.no_topup,
-        exchange_code=EXCHANGE_CODE,
+        exchange_code=EXCHANGE_CODE, active_only=args.active_only,
     )
 
 
