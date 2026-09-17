@@ -25,6 +25,30 @@ old_date, new_date = c.render_sidebar(dfs, title="Options Dashboard")
 MAX_DRILL = 8  # distinct colors available for overlaid series
 
 
+def _load_gate(key_prefix: str, panel: str) -> bool:
+    """Gates an expander's body behind an explicit 'Load' click.
+
+    st.expander does not skip its contents when collapsed — Streamlit still
+    executes everything inside it on every rerun, whether the user has ever
+    opened it or not. For the three heaviest panels (OI Snapshot, Drill Down,
+    Time Series) that means their full pivot/HTML/chart cost was being paid
+    on every single filter change on every tab, even for panels nobody looked
+    at this session. This defers that cost until the user actually asks for
+    it; the flag persists in session_state so it stays live (recomputing on
+    filter changes) once loaded, exactly like the old always-on behavior.
+    """
+    gate_key = f"{key_prefix}_{panel}_loaded"
+    loaded = st.session_state.get(gate_key, False)
+    if not loaded:
+        if st.button("Load", key=f"{key_prefix}_{panel}_btn",
+                     help="Computed on demand to keep other tabs/filters snappy."):
+            st.session_state[gate_key] = True
+            st.rerun()
+        else:
+            st.caption("Not loaded yet — click Load to compute this panel.")
+    return st.session_state.get(gate_key, False)
+
+
 def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
     """Multi-select option picker + overlaid OI / Volume / Settle / ImpVol charts."""
     import plotly.graph_objects as go  # lazy — keeps cold start fast
@@ -309,53 +333,59 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
             unsafe_allow_html=True)
 
     with st.expander("OI Snapshot — Old Date vs New Date"):
-        call_oi_old = c.get_oi_snapshot_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
-        put_oi_old  = c.get_oi_snapshot_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
-        call_oi_new = c.get_oi_snapshot_pivot(df, month_keys, "Call", new_date, new_date, min_oi)
-        put_oi_new  = c.get_oi_snapshot_pivot(df, month_keys, "Put",  new_date, new_date, min_oi)
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            st.markdown(f"**Old Date — {old_date.strftime('%d %b %Y')}**")
-            st.markdown(
-                c.render_butterfly(call_oi_old, put_oi_old, grid, custom_atm, c.vol_color,
-                                   month_keys, how="sum", fmt="{:.0f}", footer=True, title=title),
-                unsafe_allow_html=True)
-        with sc2:
-            st.markdown(f"**New Date — {new_date.strftime('%d %b %Y')}**")
-            st.markdown(
-                c.render_butterfly(call_oi_new, put_oi_new, grid, custom_atm, c.vol_color,
-                                   month_keys, how="sum", fmt="{:.0f}", footer=True, title=title),
-                unsafe_allow_html=True)
+        if _load_gate(key_prefix, "snap"):
+            call_oi_old = c.get_oi_snapshot_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
+            put_oi_old  = c.get_oi_snapshot_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
+            call_oi_new = c.get_oi_snapshot_pivot(df, month_keys, "Call", new_date, new_date, min_oi)
+            put_oi_new  = c.get_oi_snapshot_pivot(df, month_keys, "Put",  new_date, new_date, min_oi)
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.markdown(f"**Old Date — {old_date.strftime('%d %b %Y')}**")
+                st.markdown(
+                    c.render_butterfly(call_oi_old, put_oi_old, grid, custom_atm, c.vol_color,
+                                       month_keys, how="sum", fmt="{:.0f}", footer=True, title=title),
+                    unsafe_allow_html=True)
+            with sc2:
+                st.markdown(f"**New Date — {new_date.strftime('%d %b %Y')}**")
+                st.markdown(
+                    c.render_butterfly(call_oi_new, put_oi_new, grid, custom_atm, c.vol_color,
+                                       month_keys, how="sum", fmt="{:.0f}", footer=True, title=title),
+                    unsafe_allow_html=True)
 
     with st.expander("Drill Down — Option Time Series (multi-select)"):
-        _drilldown(df, key_prefix, title, new_date, min_oi, month_keys)
+        if _load_gate(key_prefix, "drill"):
+            _drilldown(df, key_prefix, title, new_date, min_oi, month_keys)
 
     with st.expander("OI & Volume Time Series — All Strikes"):
-        all_d = sorted(df["date"].dt.date.unique())
-        if len(all_d) >= 2:
-            dr = st.slider("Date Range", min_value=all_d[0], max_value=all_d[-1],
-                           value=(all_d[0], all_d[-1]), key=f"{key_prefix}_ts_dr")
-            sub = df[(df["date"].dt.date >= dr[0]) & (df["date"].dt.date <= dr[1])].copy()
-            # min_count=1: a date where OI is null across every strike (LSEG
-            # publishes OI a day behind Settle/Volume, so the latest date is
-            # routinely all-null) must sum to NaN, not 0 — plain .sum()
-            # treats an all-NaN group as 0, which drew a false plunge to zero
-            # on the most recent point instead of leaving it as a gap.
-            daily = (sub.groupby(["date", "option_type"])
-                     .agg(oi=("oi", lambda s: s.sum(min_count=1)),
-                          volume=("volume", lambda s: s.sum(min_count=1)))
-                     .reset_index())
-            tc1, tc2 = st.columns(2)
-            with tc1:
-                st.markdown("**Call / Put OI**")
-                oi_w = daily.pivot(index="date", columns="option_type", values="oi")
-                oi_w.columns.name = None
-                st.line_chart(oi_w.rename(columns={"Call": "Call OI", "Put": "Put OI"}))
-            with tc2:
-                st.markdown("**Call / Put Volume**")
-                vol_w = daily.pivot(index="date", columns="option_type", values="volume")
-                vol_w.columns.name = None
-                st.line_chart(vol_w.rename(columns={"Call": "Call Vol", "Put": "Put Vol"}))
+        if _load_gate(key_prefix, "ts"):
+            all_d = sorted(df["date"].dt.date.unique())
+            if len(all_d) >= 2:
+                dr = st.slider("Date Range", min_value=all_d[0], max_value=all_d[-1],
+                               value=(all_d[0], all_d[-1]), key=f"{key_prefix}_ts_dr")
+                sub = df[(df["date"].dt.date >= dr[0]) & (df["date"].dt.date <= dr[1])].copy()
+                # min_count=1: a date where OI is null across every strike (LSEG
+                # publishes OI a day behind Settle/Volume, so the latest date is
+                # routinely all-null) must sum to NaN, not 0 — plain .sum()
+                # treats an all-NaN group as 0, which drew a false plunge to zero
+                # on the most recent point instead of leaving it as a gap.
+                # observed=True: option_type is now a category dtype (2 values,
+                # both always present) — explicit so a future pandas default
+                # change can't alter this groupby's behavior silently.
+                daily = (sub.groupby(["date", "option_type"], observed=True)
+                         .agg(oi=("oi", lambda s: s.sum(min_count=1)),
+                              volume=("volume", lambda s: s.sum(min_count=1)))
+                         .reset_index())
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    st.markdown("**Call / Put OI**")
+                    oi_w = daily.pivot(index="date", columns="option_type", values="oi")
+                    oi_w.columns.name = None
+                    st.line_chart(oi_w.rename(columns={"Call": "Call OI", "Put": "Put OI"}))
+                with tc2:
+                    st.markdown("**Call / Put Volume**")
+                    vol_w = daily.pivot(index="date", columns="option_type", values="volume")
+                    vol_w.columns.name = None
+                    st.line_chart(vol_w.rename(columns={"Call": "Call Vol", "Put": "Put Vol"}))
 
 
 # ── Main layout ────────────────────────────────────────────────────────────────
@@ -364,16 +394,38 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
 # OI Change/Volume headers) instead of a fixed banner, so the vertical space
 # goes to data instead of a repeated header on every tab.
 
-tabs = st.tabs([cm["tab_label"] for cm in c.COMMODITIES])
+# st.tabs() looks native but does NOT lazy-render: Streamlit executes every
+# `with tab:` block on every single rerun regardless of which tab is visually
+# active, purely CSS-hiding the rest. With 6 commodities that meant changing
+# one filter on KC silently recomputed and re-serialized SB/CT/CC/LRC/LCC's
+# full pivots, butterfly HTML, and charts too, every time. A radio-based
+# picker only executes the selected commodity's render call — the other 5/6
+# of that work is skipped entirely instead of computed-and-hidden. Widget
+# state for a commodity you switch away from is preserved in session_state
+# (Streamlit keeps it regardless of whether the widget re-renders this run),
+# so switching back restores exactly where you left it — no behavior change,
+# just far less rendered per interaction.
+st.markdown("""<style>
+div[data-testid="stRadio"] > div[role="radiogroup"]{gap:2px}
+div[data-testid="stRadio"] label{
+    padding:7px 16px !important; border:1px solid #e0e0e0; border-bottom:2px solid transparent;
+    background:#f7f7f7; margin-bottom:0 !important;
+}
+div[data-testid="stRadio"] label:has(input:checked){
+    background:#fff; border-bottom:2px solid #1a56cc; font-weight:600;
+}
+</style>""", unsafe_allow_html=True)
 
-for tab, cm in zip(tabs, c.COMMODITIES):
-    with tab:
-        atm_val = atm_data.get(cm["key"])
-        atm_label = cm["atm_fmt"](atm_val) if atm_val is not None else "—"
-        render_commodity_tab(
-            df=dfs[cm["key"]], atm_val=atm_val, atm_label=atm_label,
-            old_date=old_date, new_date=new_date,
-            key_prefix=cm["key"].lower(), title=cm["title"], ric_fn=cm["ric_fn"],
-            display_step=cm["display_step"], mround_default=cm["mround_default"],
-            ingest_note=cm["ingest_note"],
-        )
+_by_label = {cm["tab_label"]: cm for cm in c.COMMODITIES}
+_selected = st.radio("Commodity", list(_by_label.keys()), horizontal=True,
+                     label_visibility="collapsed", key="active_commodity")
+cm = _by_label[_selected]
+atm_val = atm_data.get(cm["key"])
+atm_label = cm["atm_fmt"](atm_val) if atm_val is not None else "—"
+render_commodity_tab(
+    df=dfs[cm["key"]], atm_val=atm_val, atm_label=atm_label,
+    old_date=old_date, new_date=new_date,
+    key_prefix=cm["key"].lower(), title=cm["title"], ric_fn=cm["ric_fn"],
+    display_step=cm["display_step"], mround_default=cm["mround_default"],
+    ingest_note=cm["ingest_note"],
+)

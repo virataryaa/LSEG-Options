@@ -53,41 +53,46 @@ SERIES_COLORS = ["#4285f4", "#dc4b4b", "#f59e0b", "#34a853",
 
 
 # ── Data loaders ───────────────────────────────────────────────────────────────
-@st.cache_data(ttl=1800)
+# cache_resource (not cache_data): these DataFrames are never mutated in place
+# anywhere downstream (every consumer either reads them or works off an
+# explicit .copy()/boolean-mask subframe) — verified by grep before this
+# change. cache_data re-copies/re-hashes its return value on every access as a
+# mutation safeguard we don't need here; cache_resource skips that entirely.
+# If any future code ever does `df["x"] = ...` directly on the object handed
+# back from these loaders, that mutation would now be visible to every
+# session sharing the cache — keep mutating only copies.
+def _load_options(path):
+    df = pd.read_parquet(path)
+    df["date"] = pd.to_datetime(df["date"])
+    if "series" in df.columns:
+        df = df.drop(columns=["series"])   # not read anywhere in this app
+    if "option_type" in df.columns:
+        df["option_type"] = df["option_type"].astype("category")  # 2 values, pure filter key
+    return df
+
+@st.cache_resource(ttl=1800)
 def load_kc():
-    df = pd.read_parquet(DB_PATH / "KC_options_ice.parquet")
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    return _load_options(DB_PATH / "KC_options_ice.parquet")
 
-@st.cache_data(ttl=1800)
+@st.cache_resource(ttl=1800)
 def load_cc():
-    df = pd.read_parquet(DB_PATH / "CC_options_ice.parquet")
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    return _load_options(DB_PATH / "CC_options_ice.parquet")
 
-@st.cache_data(ttl=1800)
+@st.cache_resource(ttl=1800)
 def load_sb():
-    df = pd.read_parquet(DB_PATH / "SB_options_ice.parquet")
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    return _load_options(DB_PATH / "SB_options_ice.parquet")
 
-@st.cache_data(ttl=1800)
+@st.cache_resource(ttl=1800)
 def load_ct():
-    df = pd.read_parquet(DB_PATH / "CT_options_ice.parquet")
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    return _load_options(DB_PATH / "CT_options_ice.parquet")
 
-@st.cache_data(ttl=1800)
+@st.cache_resource(ttl=1800)
 def load_lrc():
-    df = pd.read_parquet(DB_PATH / "LRC_options_ice.parquet")
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    return _load_options(DB_PATH / "LRC_options_ice.parquet")
 
-@st.cache_data(ttl=1800)
+@st.cache_resource(ttl=1800)
 def load_lcc():
-    df = pd.read_parquet(DB_PATH / "LCC_options_ice.parquet")
-    df["date"] = pd.to_datetime(df["date"])
-    return df
+    return _load_options(DB_PATH / "LCC_options_ice.parquet")
 
 @st.cache_data(ttl=1800)
 def load_fut(name: str) -> pd.DataFrame:
