@@ -92,13 +92,29 @@ def sync_futures() -> tuple[bool, str]:
 
 
 def run_ingest(script: Path, label: str) -> tuple[bool, str]:
+    """Runs one commodity's ingest, streaming its output live to the cmd.exe
+    window as it happens (batch N/34, OI top-up, etc. — all already logged
+    inside the ingest scripts, just never visible before). The old
+    subprocess.run(capture_output=True) buffered everything until the process
+    exited, which is why a 26-minute rate-limited KC run showed nothing on
+    screen the whole time. Still returns the full text for the log file/email.
+    """
     log(f"Running {label} ingest...")
-    result = subprocess.run([PYTHON, str(script)], capture_output=True, text=True)
-    output = result.stdout + result.stderr
+    lines = []
+    proc = subprocess.Popen(
+        [PYTHON, str(script)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        lines.append(line)
+    proc.wait()
+    output = "".join(lines)
     # kc_ingest_lseg.py / _common.py's run_ingest sys.exit(1) on genuine
     # failure (no live RICs, no data returned) rather than silently exiting 0
     # with "nothing to save" — so returncode==0 here is a reliable signal.
-    return result.returncode == 0, output
+    return proc.returncode == 0, output
 
 
 def git_push(files: list[Path]) -> tuple[bool, str]:
@@ -252,14 +268,16 @@ def run_group(group_label: str, commodity_keys: list[str]):
 
     results = {}
     any_failed = False
+    n = len(commodity_keys)
     for idx, key in enumerate(commodity_keys):
         script, _parquet, _group = ALL_COMMODITIES[key]
         if idx > 0:
             log(f"Cooldown {COOLDOWN_SECONDS}s before {key}...")
             time.sleep(COOLDOWN_SECONDS)
+        log(f"[{idx + 1}/{n}] {key} starting...")
         ok, out = run_ingest(script, key)
         results[key] = (ok, out)
-        log(f"{key} ingest: {'OK' if ok else 'FAILED'}")
+        log(f"[{idx + 1}/{n}] {key} ingest: {'OK' if ok else 'FAILED'}")
         if not ok:
             any_failed = True
 
