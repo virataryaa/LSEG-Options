@@ -34,30 +34,6 @@ old_date, new_date = c.render_sidebar(dfs, title="Options Dashboard", active_key
 MAX_DRILL = 8  # distinct colors available for overlaid series
 
 
-def _load_gate(key_prefix: str, panel: str) -> bool:
-    """Gates an expander's body behind an explicit 'Load' click.
-
-    st.expander does not skip its contents when collapsed — Streamlit still
-    executes everything inside it on every rerun, whether the user has ever
-    opened it or not. For the three heaviest panels (OI Snapshot, Drill Down,
-    Time Series) that means their full pivot/HTML/chart cost was being paid
-    on every single filter change on every tab, even for panels nobody looked
-    at this session. This defers that cost until the user actually asks for
-    it; the flag persists in session_state so it stays live (recomputing on
-    filter changes) once loaded, exactly like the old always-on behavior.
-    """
-    gate_key = f"{key_prefix}_{panel}_loaded"
-    loaded = st.session_state.get(gate_key, False)
-    if not loaded:
-        if st.button("Load", key=f"{key_prefix}_{panel}_btn",
-                     help="Computed on demand to keep other tabs/filters snappy."):
-            st.session_state[gate_key] = True
-            st.rerun()
-        else:
-            st.caption("Not loaded yet — click Load to compute this panel.")
-    return st.session_state.get(gate_key, False)
-
-
 def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
     """Multi-select option picker + overlaid OI / Volume / Settle / ImpVol charts."""
     import plotly.graph_objects as go  # lazy — keeps cold start fast
@@ -344,8 +320,26 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
             f'raise "Rows ±" to widen.</div>',
             unsafe_allow_html=True)
 
-    with st.expander("OI Snapshot — Old Date vs New Date"):
-        if _load_gate(key_prefix, "snap"):
+    # on_change="rerun" + .open: Streamlit's native lazy-expander mechanism —
+    # the body only executes once the user has actually clicked the expander
+    # open, instead of computing on every rerun regardless of collapsed state
+    # (its default behavior). No separate Load button needed.
+    #
+    # `.open` itself was observed (via AppTest) to revert to False on a rerun
+    # triggered by an unrelated widget, not just while the expander is
+    # visually collapsed — so gating purely on `.open` would silently stop
+    # refreshing a panel the user has open the moment they touch any filter.
+    # `_seen()` latches it: once opened, stays "loaded" for the rest of the
+    # session regardless of what `.open` does on later reruns, matching the
+    # old Load-button's persistent-once-clicked behavior with no button.
+    def _seen(gate_key: str, is_open: bool) -> bool:
+        if is_open:
+            st.session_state[gate_key] = True
+        return st.session_state.get(gate_key, False)
+
+    with st.expander("OI Snapshot — Old Date vs New Date", on_change="rerun",
+                     key=f"{key_prefix}_exp_snap") as exp_snap:
+        if _seen(f"{key_prefix}_snap_seen", exp_snap.open):
             call_oi_old = c.get_oi_snapshot_pivot(df, month_keys, "Call", old_date, new_date, min_oi)
             put_oi_old  = c.get_oi_snapshot_pivot(df, month_keys, "Put",  old_date, new_date, min_oi)
             call_oi_new = c.get_oi_snapshot_pivot(df, month_keys, "Call", new_date, new_date, min_oi)
@@ -364,12 +358,14 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
                                        month_keys, how="sum", fmt="{:.0f}", footer=True, title=title),
                     unsafe_allow_html=True)
 
-    with st.expander("Drill Down — Option Time Series (multi-select)"):
-        if _load_gate(key_prefix, "drill"):
+    with st.expander("Drill Down — Option Time Series (multi-select)", on_change="rerun",
+                     key=f"{key_prefix}_exp_drill") as exp_drill:
+        if _seen(f"{key_prefix}_drill_seen", exp_drill.open):
             _drilldown(df, key_prefix, title, new_date, min_oi, month_keys)
 
-    with st.expander("OI & Volume Time Series — All Strikes"):
-        if _load_gate(key_prefix, "ts"):
+    with st.expander("OI & Volume Time Series — All Strikes", on_change="rerun",
+                     key=f"{key_prefix}_exp_ts") as exp_ts:
+        if _seen(f"{key_prefix}_ts_seen", exp_ts.open):
             all_d = sorted(df["date"].dt.date.unique())
             if len(all_d) >= 2:
                 dr = st.slider("Date Range", min_value=all_d[0], max_value=all_d[-1],
