@@ -766,14 +766,10 @@ def oi_notice(df, new_date, key):
         return
     fb = latest_oi_date(df, on_or_before=new_date)
     if fb:
-        st.warning(
-            f"No Open Interest published for {key} on {new_date.strftime('%d %b %Y')} "
-            f"— LSEG releases OI one session behind Settle/Volume. "
-            f"OI Change will be blank; latest OI is **{fb.strftime('%d %b %Y')}**. "
-            f"Pick that as New Date to see positioning. Volume and price are unaffected."
-        )
+        st.warning(f"OI not yet published for {new_date.strftime('%d %b')} — latest is "
+                   f"**{fb.strftime('%d %b')}**.")
     else:
-        st.warning(f"No Open Interest data available for {key}.")
+        st.warning(f"No OI data available for {key}.")
 
 
 def render_controls(df, atm_val, atm_label, atm_data, key_prefix, title,
