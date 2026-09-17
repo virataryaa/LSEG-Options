@@ -442,6 +442,21 @@ st.markdown("""<style>
     background:#1a56cc !important; box-shadow:0 1px 3px rgba(0,0,0,.18) !important;
 }
 .st-key-nav_commodity button[kind="segmented_controlActive"] p { color:#ffffff !important; }
+
+/* Expander panels (OI Snapshot, Drill Down, Time Series) — same accent as the
+   commodity picker above, anchored only to Streamlit's stable public
+   data-testids (stExpander / stExpanderIcon / stExpanderDetails) rather than
+   any undocumented internal class names, so it won't quietly break on a
+   Streamlit upgrade. */
+div[data-testid="stExpander"] {
+    border:1px solid #e3e7ee !important; border-radius:8px !important;
+    overflow:hidden; transition:border-color .15s ease, box-shadow .15s ease;
+}
+div[data-testid="stExpander"]:hover {
+    border-color:#1a56cc !important; box-shadow:0 1px 6px rgba(26,86,204,.10);
+}
+div[data-testid="stExpanderIcon"] svg { color:#1a56cc !important; }
+div[data-testid="stExpanderDetails"] { padding-top:2px; }
 </style>""", unsafe_allow_html=True)
 
 _by_label = {cm["tab_label"]: cm for cm in c.COMMODITIES}
