@@ -302,13 +302,12 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     # and read +5,364 while the whole board was +3,894 — the wings had moved
     # the other way. Without this line the headline number reads as a
     # board-wide total.
-    def _abs_sum(p):
-        if p is None or p.empty:
-            return 0.0
-        return float(np.nansum(np.abs(p.to_numpy(dtype=float))))
-
-    shown_abs = _abs_sum(vis["coi"]) + _abs_sum(vis["poi"])
-    board_abs = _abs_sum(call_oi) + _abs_sum(put_oi)
+    #
+    # Coverage is measured on the SOURCE strikes the grid includes, not on the
+    # projected values — see grid_coverage(). Measuring after projection made
+    # coarse Nearest steps look like they were hiding the board when they were
+    # dropping nothing at all (opposite-signed strikes netting inside a bucket).
+    shown_abs, board_abs = c.grid_coverage([call_oi, put_oi], rows, tol)
     n_traded  = len(cfg["all_strikes_data"])
     if board_abs > 0:
         cov = shown_abs / board_abs * 100

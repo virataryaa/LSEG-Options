@@ -459,6 +459,35 @@ def build_strike_grid(custom_atm, custom_step, strike_mode, all_strikes_data, n_
     return rows, step / 2
 
 
+def grid_coverage(pivs, rows, snap_tol):
+    """(kept_abs, board_abs): how much of the source data the display rows include.
+
+    Measured on the SOURCE strikes, before bucketing. Summing |value| AFTER
+    projection understates coverage badly in Nearest mode: opposite-signed
+    strikes landing in one bucket net against each other, so a coarse step can
+    drop nothing at all and still look like it is hiding half the board.
+    Measured on KC (step 50 and 100, n=25): zero strikes dropped, yet the
+    post-projection figure read 69% and 52% respectively.
+    """
+    rows_f = np.asarray([float(r) for r in rows], dtype=float)
+    kept = board = 0.0
+    for piv in pivs:
+        if piv is None or piv.empty:
+            continue
+        vals = piv.to_numpy(dtype=float)
+        board += float(np.nansum(np.abs(vals)))
+        if rows_f.size == 0:
+            continue
+        src = np.asarray(piv.index, dtype=float)
+        if snap_tol is None:
+            keep = np.isin(src, rows_f)          # Exact mode: literal row membership
+        else:
+            dist = np.abs(src[:, None] - rows_f[None, :]).min(axis=1)
+            keep = dist <= (snap_tol + 1e-9)
+        kept += float(np.nansum(np.abs(vals[keep])))
+    return kept, board
+
+
 def project_to_grid(piv, rows, snap_tol, how="sum"):
     """Reindex a strike-indexed pivot onto the display rows.
 
