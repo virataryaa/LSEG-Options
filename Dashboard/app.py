@@ -293,29 +293,6 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
         unsafe_allow_html=True
     )
 
-    # The KPIs and the TOT footer are deliberately scoped to the visible grid,
-    # so state what fraction of the board that is. Measured on KC: the default
-    # +/-25 Exact window held 81% of |OI change| and read +5,364 while the
-    # whole board was +3,894 — the wings had moved the other way. Without this
-    # line the headline number reads as a board-wide total.
-    def _abs_sum(p):
-        if p is None or p.empty:
-            return 0.0
-        return float(np.nansum(np.abs(p.to_numpy(dtype=float))))
-
-    shown_abs = _abs_sum(vis["coi"]) + _abs_sum(vis["poi"])
-    board_abs = _abs_sum(call_oi) + _abs_sum(put_oi)
-    n_traded  = len(cfg["all_strikes_data"])
-    if board_abs > 0:
-        cov = shown_abs / board_abs * 100
-        tone = "#888" if cov >= 99 else "#b45309"
-        st.markdown(
-            f'<div style="font-size:10px;color:{tone};padding:0 0 10px">'
-            f'Grid shows <b>{len(rows)}</b> of <b>{n_traded}</b> traded strikes — '
-            f'<b>{cov:.0f}%</b> of board |OI change|. KPIs and TOT are scoped to these rows; '
-            f'raise "Rows ±" to widen.</div>',
-            unsafe_allow_html=True)
-
     date_range = (f'<span style="font-size:11px;font-weight:400;color:#888">'
                   f'&nbsp;{old_date.strftime("%d %b")} &rarr; {new_date.strftime("%d %b %Y")}</span>')
     cl, cr = st.columns(2)
@@ -330,6 +307,31 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
         st.markdown(
             c.render_butterfly(call_vol, put_vol, grid, custom_atm, c.vol_color, month_keys,
                                how="sum", fmt="{:.0f}", footer=True, title=title),
+            unsafe_allow_html=True)
+
+    # The KPIs and the TOT footer are deliberately scoped to the visible grid
+    # above, so state what fraction of the board that is — placed right below
+    # the grid it describes rather than between the KPI row and the tables.
+    # Measured on KC: the default +/-25 Exact window held 81% of |OI change|
+    # and read +5,364 while the whole board was +3,894 — the wings had moved
+    # the other way. Without this line the headline number reads as a
+    # board-wide total.
+    def _abs_sum(p):
+        if p is None or p.empty:
+            return 0.0
+        return float(np.nansum(np.abs(p.to_numpy(dtype=float))))
+
+    shown_abs = _abs_sum(vis["coi"]) + _abs_sum(vis["poi"])
+    board_abs = _abs_sum(call_oi) + _abs_sum(put_oi)
+    n_traded  = len(cfg["all_strikes_data"])
+    if board_abs > 0:
+        cov = shown_abs / board_abs * 100
+        tone = "#888" if cov >= 99 else "#b45309"
+        st.markdown(
+            f'<div style="font-size:10px;color:{tone};padding:6px 0 4px">'
+            f'Grid shows <b>{len(rows)}</b> of <b>{n_traded}</b> traded strikes — '
+            f'<b>{cov:.0f}%</b> of board |OI change|. KPIs and TOT are scoped to these rows; '
+            f'raise "Rows ±" to widen.</div>',
             unsafe_allow_html=True)
 
     with st.expander("OI Snapshot — Old Date vs New Date"):
