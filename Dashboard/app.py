@@ -272,27 +272,6 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     cp_oi  = (f"{abs(c_oi/p_oi):.2f}" if p_oi and not np.isnan(p_oi) and p_oi != 0 and not np.isnan(c_oi) else "—")
     cp_vol = (f"{c_vol/p_vol:.2f}"    if p_vol and not np.isnan(p_vol) and p_vol > 0 and not np.isnan(c_vol) else "—")
 
-    items = [
-        ("ATM Price",            f"{custom_atm:,.4g}"),
-        ("Call OI Δ (shown)",    c._fn(c_oi)),
-        ("Put OI Δ (shown)",     c._fn(p_oi)),
-        ("Call Volume (shown)",  c._fn(c_vol)),
-        ("Put Volume (shown)",   c._fn(p_vol)),
-        ("C/P OI Ratio",         cp_oi),
-        ("C/P Vol Ratio",        cp_vol),
-    ]
-    st.markdown(
-        '<div style="display:flex;gap:28px;padding:6px 0 12px;border-bottom:1px solid #eee;flex-wrap:wrap">'
-        + "".join(
-            f'<div><div style="font-size:9px;color:#888;letter-spacing:.07em;'
-            f'text-transform:uppercase;margin-bottom:2px">{lbl}</div>'
-            f'<div style="font-size:14px;font-weight:600;color:#1a1a2e">{val}</div></div>'
-            for lbl, val in items
-        )
-        + '</div>',
-        unsafe_allow_html=True
-    )
-
     date_range = (f'<span style="font-size:11px;font-weight:400;color:#888">'
                   f'&nbsp;{old_date.strftime("%d %b")} &rarr; {new_date.strftime("%d %b %Y")}</span>')
     cl, cr = st.columns(2)
@@ -308,6 +287,28 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
             c.render_butterfly(call_vol, put_vol, grid, custom_atm, c.vol_color, month_keys,
                                how="sum", fmt="{:.0f}", footer=True, title=title),
             unsafe_allow_html=True)
+
+    # KPI row — placed below the matrix it summarizes rather than above it.
+    items = [
+        ("ATM Price",            f"{custom_atm:,.4g}"),
+        ("Call OI Δ (shown)",    c._fn(c_oi)),
+        ("Put OI Δ (shown)",     c._fn(p_oi)),
+        ("Call Volume (shown)",  c._fn(c_vol)),
+        ("Put Volume (shown)",   c._fn(p_vol)),
+        ("C/P OI Ratio",         cp_oi),
+        ("C/P Vol Ratio",        cp_vol),
+    ]
+    st.markdown(
+        '<div style="display:flex;gap:28px;padding:12px 0 6px;border-top:1px solid #eee;flex-wrap:wrap">'
+        + "".join(
+            f'<div><div style="font-size:9px;color:#888;letter-spacing:.07em;'
+            f'text-transform:uppercase;margin-bottom:2px">{lbl}</div>'
+            f'<div style="font-size:14px;font-weight:600;color:#1a1a2e">{val}</div></div>'
+            for lbl, val in items
+        )
+        + '</div>',
+        unsafe_allow_html=True
+    )
 
     # The KPIs and the TOT footer are deliberately scoped to the visible grid
     # above, so state what fraction of the board that is — placed right below
