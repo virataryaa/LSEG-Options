@@ -398,27 +398,45 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
 # `with tab:` block on every single rerun regardless of which tab is visually
 # active, purely CSS-hiding the rest. With 6 commodities that meant changing
 # one filter on KC silently recomputed and re-serialized SB/CT/CC/LRC/LCC's
-# full pivots, butterfly HTML, and charts too, every time. A radio-based
+# full pivots, butterfly HTML, and charts too, every time. A segmented_control
 # picker only executes the selected commodity's render call — the other 5/6
 # of that work is skipped entirely instead of computed-and-hidden. Widget
 # state for a commodity you switch away from is preserved in session_state
 # (Streamlit keeps it regardless of whether the widget re-renders this run),
 # so switching back restores exactly where you left it — no behavior change,
 # just far less rendered per interaction.
+#
+# Pill-switch CSS lifted from COT_ALL/Dashboard/cot_app.py's nav (`_nav_css`,
+# the "sec" pill row) — same st.segmented_control + scoped st.container(key=)
+# pattern, same look, just one row instead of two.
 st.markdown("""<style>
-div[data-testid="stRadio"] > div[role="radiogroup"]{gap:2px}
-div[data-testid="stRadio"] label{
-    padding:7px 16px !important; border:1px solid #e0e0e0; border-bottom:2px solid transparent;
-    background:#f7f7f7; margin-bottom:0 !important;
+.st-key-nav_commodity [data-testid="stButtonGroup"] { gap:0; }
+.st-key-nav_commodity [data-testid="stButtonGroup"] > div {
+    display:inline-flex; gap:4px; padding:4px; background:#f1f3f7;
+    border:1px solid #e3e7ee; border-radius:999px;
 }
-div[data-testid="stRadio"] label:has(input:checked){
-    background:#fff; border-bottom:2px solid #1a56cc; font-weight:600;
+.st-key-nav_commodity button[kind^="segmented_control"] {
+    border:none !important; border-radius:999px !important; margin:0 !important;
+    padding:.35rem 1.25rem !important; min-height:0 !important;
+    background:transparent !important; box-shadow:none !important;
+    transition:background .15s ease, color .15s ease;
 }
+.st-key-nav_commodity button[kind^="segmented_control"] p {
+    font-size:.84rem !important; font-weight:600 !important; letter-spacing:.02em;
+    color:#5b6472 !important;
+}
+.st-key-nav_commodity button[kind="segmented_control"]:hover { background:#e6e9f0 !important; }
+.st-key-nav_commodity button[kind="segmented_controlActive"] {
+    background:#1a56cc !important; box-shadow:0 1px 3px rgba(0,0,0,.18) !important;
+}
+.st-key-nav_commodity button[kind="segmented_controlActive"] p { color:#ffffff !important; }
 </style>""", unsafe_allow_html=True)
 
 _by_label = {cm["tab_label"]: cm for cm in c.COMMODITIES}
-_selected = st.radio("Commodity", list(_by_label.keys()), horizontal=True,
-                     label_visibility="collapsed", key="active_commodity")
+with st.container(key="nav_commodity"):
+    _selected = st.segmented_control("Commodity", list(_by_label.keys()),
+                                     default="Arabica", key="active_commodity",
+                                     label_visibility="collapsed") or "Arabica"
 cm = _by_label[_selected]
 atm_val = atm_data.get(cm["key"])
 atm_label = cm["atm_fmt"](atm_val) if atm_val is not None else "—"
