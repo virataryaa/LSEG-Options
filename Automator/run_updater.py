@@ -9,6 +9,7 @@ but any failure marks the whole run as failed for the email subject/exit code.
 import shutil
 import subprocess
 import sys
+import time
 import datetime
 import traceback
 from pathlib import Path
@@ -20,14 +21,27 @@ CODE_DIR = ROOT / "Code"
 LOG_FILE = Path(__file__).resolve().parent / "run_log.txt"
 PYTHON   = sys.executable
 
+# All 6 re-enabled now that the 429-backoff and OI top-up fixes (proven on
+# KC first) are ported into _common.py, which CC/SB/CT/LRC/LCC all share.
+#
+# Ordered smallest-universe-first (LRC 140 RICs .. CC ~2,900), not
+# alphabetically. The 09-15 run's 429s were a cumulative request-volume
+# problem on the local Workspace proxy, not a per-commodity one — CT (5th)
+# started throttling and LRC/LCC (6th/7th) failed outright with zero data
+# because the budget was already exhausted by the time their turn came.
+# Running the cheapest universes first means a full order-of-magnitude
+# smaller commodity is never the one starved by commodities that ran before
+# it, and COOLDOWN_SECONDS below gives the proxy's rate window a chance to
+# reset between each one.
 COMMODITIES = {
     "KC":  (CODE_DIR / "kc_ingest_lseg.py",  ROOT / "Database" / "KC_options_ice.parquet"),
-    "CC":  (CODE_DIR / "cc_ingest_lseg.py",  ROOT / "Database" / "CC_options_ice.parquet"),
-    "SB":  (CODE_DIR / "sb_ingest_lseg.py",  ROOT / "Database" / "SB_options_ice.parquet"),
-    "CT":  (CODE_DIR / "ct_ingest_lseg.py",  ROOT / "Database" / "CT_options_ice.parquet"),
     "LRC": (CODE_DIR / "lrc_ingest_lseg.py", ROOT / "Database" / "LRC_options_ice.parquet"),
     "LCC": (CODE_DIR / "lcc_ingest_lseg.py", ROOT / "Database" / "LCC_options_ice.parquet"),
+    "SB":  (CODE_DIR / "sb_ingest_lseg.py",  ROOT / "Database" / "SB_options_ice.parquet"),
+    "CT":  (CODE_DIR / "ct_ingest_lseg.py",  ROOT / "Database" / "CT_options_ice.parquet"),
+    "CC":  (CODE_DIR / "cc_ingest_lseg.py",  ROOT / "Database" / "CC_options_ice.parquet"),
 }
+COOLDOWN_SECONDS = 60  # pause between commodities to let the rate-limit window reset
 ATM_JSON = ROOT / "Dashboard" / "atm.json"
 
 # Daily-refreshed master Futures database (separate migration, its own
@@ -126,7 +140,11 @@ def main():
 
     results = {}
     any_failed = False
-    for label, (script, _parquet) in COMMODITIES.items():
+    labels = list(COMMODITIES.items())
+    for idx, (label, (script, _parquet)) in enumerate(labels):
+        if idx > 0:
+            log(f"Cooldown {COOLDOWN_SECONDS}s before {label} (let the rate-limit window reset)...")
+            time.sleep(COOLDOWN_SECONDS)
         ok, out = run_ingest(script, label)
         results[label] = (ok, out)
         log(f"{label} ingest: {'OK' if ok else 'FAILED'}")

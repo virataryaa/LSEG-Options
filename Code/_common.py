@@ -108,18 +108,38 @@ def parse_ric(ric: str, commodity: str, multiplier: int, prefix: str = "1"):
 
 
 def discover_meta(ld, commodity: str, multiplier: int, log, prefix: str = "1",
-                  include_weeklies: bool = False):
+                  include_weeklies: bool = False, exchange_code: str = None):
     """Enumerate the live listed option board from LSEG search.
 
     Returns the same meta columns as build_meta() so the rest of the pipeline
     is unchanged, plus a `series` column.
+
+    exchange_code: server-side ExchangeCode filter (e.g. 'IEU' for ICE Europe).
+    Needed for LRC/LCC, which skip the '1' disambiguator prefix (already an
+    unambiguous 3-letter root on their own exchange) — but LSEG's RIC-prefix
+    search has no exchange scoping by default, so 'startswith(RIC,"LRC")' also
+    matches unrelated OPRA equity options on tickers that happen to start with
+    the same letters (confirmed live 2026-09-17: Lam Research Corp equity
+    options under "LRC*", and unrelated non-coffee ICE Europe instruments under
+    "LRC*" too). Both LRC and LCC's true match count (12,357 / 13,980) exceeds
+    LSEG's 10,000-row search cap, so without this filter the truncation could
+    silently drop real contracts before the DTSubjectName name-filter below
+    ever runs. Filtering to ExchangeCode='IEU' cut LRC to 3,207 and LCC to
+    6,603 — both safely under the cap — while the name filter below still
+    cleans up the small remaining same-exchange noise (e.g. other tickers'
+    Flex Equity options also listed on ICE Europe). KC/CC/SB/CT keep their '1'
+    prefix and were confirmed NOT to hit the cap (KC: 2,127 total, all genuine
+    ICE US/CBT/IOM) — exchange_code stays None for those, unchanged.
     """
     from lseg.data.content import search
 
     search_prefix = f"{prefix}{commodity}"
+    filt = f"startswith(RIC,'{search_prefix}') and ExpiryDate ne null"
+    if exchange_code:
+        filt += f" and ExchangeCode eq '{exchange_code}'"
     r = search.Definition(
         view=search.Views.DERIVATIVE_QUOTES,
-        filter=f"startswith(RIC,'{search_prefix}') and ExpiryDate ne null",
+        filter=filt,
         select="RIC,DTSubjectName,ExpiryDate,StrikePrice,CallPutOption",
         top=SEARCH_TOP,
     ).get_data()
@@ -317,10 +337,18 @@ def fetch_batch(ld, rics: list, start: str, end: str, log, retries: int = FETCH_
             if "not found" in err.lower() or "70005" in err:
                 return pd.DataFrame(), True       # genuinely absent
             if attempt < retries:
-                log.warning("  batch error (attempt %d/%d): %s — retrying in %ds",
-                            attempt, retries, err[:110], delay)
-                time.sleep(delay)
-                delay *= 2
+                # A 429 means the proxy is throttling the whole run, not just
+                # this batch — the generic 5s/10s backoff was measured too
+                # short on 2026-09-15 (CT lost 318 RICs, LRC/LCC failed outright
+                # to sustained 429s that never cleared within 3 retries). Same
+                # fix as kc_ingest_lseg.py: rate-limit errors get a longer,
+                # steeper wait so later batches have a real chance to land.
+                is_429 = "429" in err or "too many requests" in err.lower()
+                wait = max(delay, 30) if is_429 else delay
+                log.warning("  batch error (attempt %d/%d)%s: %s — retrying in %ds",
+                            attempt, retries, " [rate-limited]" if is_429 else "", err[:110], wait)
+                time.sleep(wait)
+                delay = wait * 2
                 continue
             log.error("  batch FAILED after %d attempts: %s", retries, err[:150])
             return pd.DataFrame(), False          # could not be established
@@ -352,13 +380,86 @@ def fetch_batch(ld, rics: list, start: str, end: str, log, retries: int = FETCH_
     return (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()), True
 
 
+def topup_open_interest(ld, parquet_path: Path, log) -> int:
+    """Fill the last completed session's OI from the real-time quote.
+
+    Same technique as Futures/Code/futures_builder_lseg.py, ported to options
+    via kc_ingest_lseg.py (verified live for KC on 2026-09-16: snapshot OPINT_1
+    matched the last stored session's OI on every comparable RIC). get_history's
+    daily file does not carry the newest session's OPINT_1 until after
+    midnight; the real-time quote for the same RIC already does — one session
+    behind, never today's intraday tally.
+
+    Freshness is judged market-wide, not per-contract: a quiet strike can
+    carry an unchanged OI for days for real, so "unchanged" alone never proves
+    the exchange hasn't published yet. Only accept the batch if a majority of
+    comparable RICs actually moved.
+    """
+    if not parquet_path.exists():
+        return 0
+    df = pd.read_parquet(parquet_path)
+    df["date"] = pd.to_datetime(df["date"])
+
+    prior = df[df["date"] < today]
+    if prior.empty:
+        return 0
+    target = prior["date"].max()
+
+    need = df[(df["date"] == target) & df["settle"].notna() & df["oi"].isna()]
+    if need.empty:
+        log.info("OI already complete for %s", target.date())
+        return 0
+
+    rics = sorted(need["ric"].unique())
+    snaps = []
+    for i in range(0, len(rics), PREFILTER_SIZE):
+        batch = rics[i:i + PREFILTER_SIZE]
+        try:
+            snaps.append(ld.get_data(universe=batch, fields=["OPINT_1"]))
+        except Exception as e:
+            log.warning("  OI top-up quote batch failed: %s", str(e)[:120])
+    if not snaps:
+        return 0
+    snap = pd.concat(snaps, ignore_index=True).set_index("Instrument")["OPINT_1"]
+
+    prev_oi = (df[(df["date"] < target) & df["oi"].notna()]
+               .sort_values("date").groupby("ric")["oi"].last())
+
+    comparable = [r for r in rics if pd.notna(prev_oi.get(r)) and pd.notna(snap.get(r))]
+    if not comparable:
+        log.info("OI top-up: no RIC with a prior OI to check the quote against — "
+                 "skipped, left for the historical fetch")
+        return 0
+    moved = [r for r in comparable if abs(float(snap[r]) - float(prev_oi[r])) >= 1]
+    if len(moved) * 2 < len(comparable):
+        log.info("OI top-up: only %d/%d comparable RICs show a changed OI — "
+                 "%s not published yet, left for the next run", len(moved), len(comparable), target.date())
+        return 0
+
+    filled = 0
+    for ric in rics:
+        v = snap.get(ric)
+        if pd.isna(v):
+            continue
+        df.loc[(df["date"] == target) & (df["ric"] == ric), "oi"] = float(v)
+        filled += 1
+    if filled:
+        df["oi"] = df["oi"].astype("Int64")
+        df = df.sort_values(["ric", "date"]).reset_index(drop=True)
+        df.to_parquet(parquet_path, index=False)
+        log.info("OI top-up: filled OI on %s for %d contract(s) (%d/%d comparable moved)",
+                 target.date(), filled, len(moved), len(comparable))
+    return filled
+
+
 def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: int,
                 strike_multiplier: int, months_forward: int, backfill_days: int,
                 rolling_days: int, batch_size: int,
                 parquet_path: Path, atm_json: Path, log, force_full: bool = False,
                 ric_prefix: str = "1", allowed_months: set = None, atm_field: str = "TRDPRC_1",
                 use_discovery: bool = True, include_weeklies: bool = False,
-                require_oi: bool = False, dry_run: bool = False, days: int = None):
+                require_oi: bool = False, dry_run: bool = False, days: int = None,
+                no_topup: bool = False, exchange_code: str = None):
     """Shared main-loop body. Returns the final DataFrame written to parquet.
     ric_prefix: '1' for KC/CC/SB/CT-style RICs, '' for LRC/LCC (root is already
     unambiguous, no disambiguator prefix — confirmed live via discovery.search).
@@ -383,7 +484,8 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
         if use_discovery:
             try:
                 meta = discover_meta(ld, commodity, strike_multiplier, log,
-                                     prefix=ric_prefix, include_weeklies=include_weeklies)
+                                     prefix=ric_prefix, include_weeklies=include_weeklies,
+                                     exchange_code=exchange_code)
             except Exception as e:
                 log.warning("Discovery failed (%s) — falling back to the ATM window.", str(e)[:160])
                 meta = None
@@ -537,6 +639,11 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
             d_oi = last_oi["date"].max()
             log.info("Latest OI date: %s | total OI across board: %s lots",
                      d_oi.date(), f"{last_oi[last_oi['date'] == d_oi]['oi'].sum():,}")
+
+        if not no_topup:
+            filled = topup_open_interest(ld, parquet_path, log)
+            if filled:
+                log.info("OI top-up: %d contract(s) filled for the prior session", filled)
         return final
     finally:
         ld.close_session()

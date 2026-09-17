@@ -49,6 +49,8 @@ def main():
                         help="Prefilter to OI>0 only (old behaviour); default also keeps settle-quoted strikes")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report universe and coverage, then exit without writing the parquet")
+    parser.add_argument("--no-topup", action="store_true",
+                        help="Skip the post-save real-time-quote OI top-up for the prior session")
     args = parser.parse_args()
 
     log = c.make_logger("sb_ingest_lseg", Path(__file__).parent / "logs")
@@ -60,7 +62,7 @@ def main():
         parquet_path=PARQUET_PATH, atm_json=ATM_JSON, log=log,
         force_full=args.full, use_discovery=not args.legacy_window,
         include_weeklies=args.weeklies, require_oi=args.require_oi,
-        dry_run=args.dry_run, days=args.days,
+        dry_run=args.dry_run, days=args.days, no_topup=args.no_topup,
     )
 
 

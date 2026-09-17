@@ -162,12 +162,23 @@ def render_sidebar(dfs, title="Options Dashboard"):
             all_dates.update(_df["date"].dt.date.unique())
     available_dates = sorted(all_dates)
 
+    if not available_dates:
+        # Every commodity's parquet failed to load (e.g. Database/ missing on
+        # a fresh clone). A selectbox with zero options raises rather than
+        # rendering empty, so stop here with an explicit message instead of
+        # crashing the whole app on first load.
+        with st.sidebar:
+            st.title(title)
+            st.error("No data available in any commodity parquet.")
+        st.error("No option data could be loaded. Check that Database/*.parquet files exist.")
+        st.stop()
+
     # Default New Date to the newest date that has OI somewhere, so the app
     # lands on a view that actually renders instead of an all-blank table.
     oi_any = set()
     for _df in dfs.values():
         oi_any.update(oi_dates(_df))
-    default_new = max(oi_any) if oi_any else (available_dates[-1] if available_dates else None)
+    default_new = max(oi_any) if oi_any else available_dates[-1]
     default_new_idx = (available_dates.index(default_new)
                        if default_new in available_dates else len(available_dates) - 1)
 
@@ -199,23 +210,44 @@ def render_sidebar(dfs, title="Options Dashboard"):
             else:
                 st.caption(f"{_label} — no data")
 
+        st.divider()
+        st.caption("Advanced analytics (Px Change, Vol Surface, IV vs RV) → `oi_advanced_analytics.py`")
+
     return old_date, new_date
 
 
 # ── Pivot helpers (all parameterised) ─────────────────────────────────────────
-def _month_keys(df):
-    return (df[["expiry_month", "expiry_year"]]
-            .drop_duplicates()
-            .sort_values(["expiry_year", "expiry_month"])
-            .apply(lambda r: (int(r.expiry_month), int(r.expiry_year)), axis=1)
-            .tolist())
+def _month_keys(df, since=None):
+    """Expiry columns for the butterfly tables, chronological.
+
+    `since` drops expiries that carry no data on or after that date, so a
+    contract that has already expired stops rendering as a permanently blank
+    column. Without it the table accumulates dead columns forever, because the
+    parquet keeps every contract it has ever seen (KC's Oct 2026 was still
+    drawing a column 12 sessions after its last trade).
+    """
+    def _keys(frame):
+        # dropna guards against a malformed ingest row (e.g. a RIC that failed
+        # metadata parsing) crashing the whole tab on .astype(int) of a NaN.
+        k = (frame[["expiry_month", "expiry_year"]].dropna()
+                  .drop_duplicates()
+                  .sort_values(["expiry_year", "expiry_month"]))
+        return [(int(m), int(y)) for m, y in zip(k["expiry_month"], k["expiry_year"])]
+
+    if since is None:
+        return _keys(df)
+    keys = _keys(df[df["date"].dt.date >= since])
+    # A commodity whose ingest is stale (LRC/LCC missed a run) can have no rows
+    # at all on or after `since`. Showing zero columns would blank the tab, so
+    # fall back to the full history rather than hiding data that does exist.
+    return keys if keys else _keys(df)
 
 def _meta(df, opt):
-    return (df[df["option_type"] == opt]
-            [["ric", "strike", "expiry_month", "expiry_year"]]
-            .drop_duplicates()
-            .assign(mk=lambda x: list(zip(x.expiry_month.astype(int), x.expiry_year.astype(int))))
-            .set_index("ric"))
+    d = (df[df["option_type"] == opt]
+         [["ric", "strike", "expiry_month", "expiry_year"]]
+         .dropna(subset=["expiry_month", "expiry_year"])
+         .drop_duplicates())
+    return d.assign(mk=lambda x: list(zip(x.expiry_month.astype(int), x.expiry_year.astype(int)))).set_index("ric")
 
 def _clean(pivot, month_keys):
     if pivot.empty:
@@ -477,16 +509,16 @@ def iv_chg_color(val, mx):
 
 # ── Butterfly HTML ─────────────────────────────────────────────────────────────
 _CSS = """<style>
-.bft{border-collapse:collapse;font-size:11px;font-family:-apple-system,sans-serif}
-.bft th,.bft td{white-space:nowrap;padding:2px 5px}
-.bft th{font-weight:600;letter-spacing:.03em;font-size:10px;text-align:center}
+.bft{border-collapse:collapse;font-size:9px;font-family:-apple-system,sans-serif}
+.bft th,.bft td{white-space:nowrap;padding:1px 4px;line-height:1.3}
+.bft th{font-weight:600;letter-spacing:.02em;font-size:8px;text-align:center}
 .bft td{text-align:right;border:1px solid #f0f0f0;color:#1a1a2e}
-.bft .sc{text-align:center;font-weight:700;font-size:11px;color:#1a1a2e;
+.bft .sc{text-align:center;font-weight:700;font-size:9px;color:#1a1a2e;
          background:#f5f5f5;border-left:2px solid #ccc;border-right:2px solid #ccc}
 .bft .sc-atm{background:#f59e0b!important;color:#1a1a2e!important;font-weight:900!important}
 .bft tr.atm-row td{border-top:2px solid #f59e0b!important;border-bottom:2px solid #f59e0b!important}
 .bft tfoot td{font-weight:700;border-top:2px solid #bbb}
-.bft tfoot .sc{font-size:9px;color:#888;background:#efefef}
+.bft tfoot .sc{font-size:8px;color:#888;background:#efefef}
 .ch{background:#dce8fb;color:#1a56cc}
 .ph{background:#fde8e8;color:#c0392b}
 .kch{background:#ebebeb;color:#555}
@@ -586,7 +618,7 @@ def butterfly_html(cpiv, ppiv, atm, cfn, month_keys, fmt="{:.0f}",
               f'<td class="sc" style="font-size:9px;color:#888">TOT</td>'
               f'{pft}</tr></tfoot>')
 
-    est_h = max(400, (len(strikes) + 4) * 22 + 90)
+    est_h = max(350, (len(strikes) + 4) * 18 + 80)
     return (f'{_CSS}<div style="overflow-x:auto;overflow-y:auto;max-height:{est_h}px">'
             f'<table class="bft"><thead>{h1}{h2}{h3}</thead>'
             f'{ft}<tbody>{"".join(body)}</tbody></table></div>')
@@ -619,6 +651,19 @@ def _fn(v, f="{:,.0f}"):
         return f.format(v)
     except Exception:
         return "—"
+
+def _decimals_for(x) -> int:
+    """How many decimal places a commodity's own numbers actually need — CC/CT/
+    LRC/LCC trade in whole numbers (0), KC in 2.5c increments (1), SB in 0.25c
+    (2). Used so the Controls panel shows "25" instead of "25.0000" for a
+    commodity that has never once needed a decimal point."""
+    from decimal import Decimal
+    try:
+        exp = Decimal(str(round(float(x), 6))).normalize().as_tuple().exponent
+        return min(4, max(0, -exp if isinstance(exp, int) else 0))
+    except Exception:
+        return 2
+
 
 def fmt_strike(x):
     try:
@@ -727,9 +772,10 @@ def oi_notice(df, new_date, key):
 
 
 def render_controls(df, atm_val, atm_label, atm_data, key_prefix, title,
-                    display_step=None, mround_default=None, ingest_note=""):
+                    display_step=None, mround_default=None, ingest_note="",
+                    since=None):
     """Renders the shared Controls expander. Returns a dict of resolved settings."""
-    month_keys       = _month_keys(df)
+    month_keys       = _month_keys(df, since=since)
     all_strikes_data = sorted(df["strike"].unique())
     atm_updated      = atm_data.get("updated", "—")
 
@@ -742,6 +788,10 @@ def render_controls(df, atm_val, atm_label, atm_data, key_prefix, title,
 
     _def_step   = float(display_step if display_step else native_gap)
     _def_mround = float(mround_default if mround_default is not None else _def_step)
+    # Decimal precision follows the commodity's own real gap, not a fixed
+    # %.4f for everyone — CC/CT/LRC/LCC never need a decimal point at all.
+    _dec = _decimals_for(_def_step)
+    _fmt_step = f"%.{_dec}f"
 
     with st.expander("Controls", expanded=False):
         c_oi, c_price, c_mround, c_mode, c_step, c_rows = st.columns([1, 1.1, 0.8, 1.2, 0.8, 0.8])
@@ -756,12 +806,12 @@ def render_controls(df, atm_val, atm_label, atm_data, key_prefix, title,
         with c_price:
             raw_price = st.number_input(
                 "Price", value=float(atm_val) if atm_val is not None else 0.0,
-                format="%.2f", key=f"{key_prefix}_raw_price",
+                format=_fmt_step, key=f"{key_prefix}_raw_price",
                 help="Raw market price (e.g. last futures settle). "
                      "The table centres on MROUND(Price, MRound).")
         with c_mround:
             mround_val = st.number_input(
-                "MRound", value=_def_mround, min_value=0.0001, format="%.4f",
+                "MRound", value=_def_mround, min_value=0.0001, format=_fmt_step,
                 key=f"{key_prefix}_mround",
                 help="Centring multiple for the ATM row: ATM = nearest multiple of "
                      "this to Price (Excel MROUND, half away from zero). Defaults to "
@@ -780,7 +830,7 @@ def render_controls(df, atm_val, atm_label, atm_data, key_prefix, title,
         with c_step:
             step_disabled = (strike_mode == "Exact")
             custom_step = st.number_input(
-                "Step", value=_def_step, min_value=0.0001, format="%.4f",
+                "Step", value=_def_step, min_value=0.0001, format=_fmt_step,
                 key=f"{key_prefix}_custom_step", disabled=step_disabled,
                 help=("Not used in Exact mode — rows come straight from the traded "
                       "strikes. Switch to Nearest to build a uniform ladder."

@@ -362,10 +362,18 @@ def fetch_batch(ld, rics: list, start: str, end: str, retries: int = FETCH_RETRI
             if "not found" in err.lower() or "70005" in err:
                 return pd.DataFrame(), True      # genuinely absent
             if attempt < retries:
-                log.warning("  batch error (attempt %d/%d): %s — retrying in %ds",
-                            attempt, retries, err[:110], delay)
-                time.sleep(delay)
-                delay *= 2
+                # A 429 means the proxy is throttling the whole run, not just
+                # this batch — the generic 5s/10s backoff was measured too
+                # short on 2026-09-15 (CT lost 318 RICs to sustained 429s that
+                # never cleared within 3 retries). Rate-limit errors get a
+                # longer, steeper wait so later batches have a real chance to
+                # land instead of failing in lockstep.
+                is_429 = "429" in err or "too many requests" in err.lower()
+                wait = max(delay, 30) if is_429 else delay
+                log.warning("  batch error (attempt %d/%d)%s: %s — retrying in %ds",
+                            attempt, retries, " [rate-limited]" if is_429 else "", err[:110], wait)
+                time.sleep(wait)
+                delay = wait * 2
                 continue
             log.error("  batch FAILED after %d attempts: %s", retries, err[:150])
             return pd.DataFrame(), False         # could not be established
@@ -397,6 +405,78 @@ def fetch_batch(ld, rics: list, start: str, end: str, retries: int = FETCH_RETRI
     return (pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()), True
 
 
+def topup_open_interest(ld, parquet_path: Path) -> int:
+    """Fill the last completed session's OI from the real-time quote.
+
+    Same technique as Futures/Code/futures_builder_lseg.py's topup_open_interest:
+    get_history's daily file is rebuilt once a day and does not carry the newest
+    session's OPINT_1 until after midnight, but the real-time quote for the same
+    RIC already does — one session behind, never today's intraday tally. Verified
+    live for KC options on 2026-09-16: snapshot OPINT_1 matched the last stored
+    session's OI on every comparable RIC (30<->30, 4<->4, 13<->~14).
+
+    Freshness is judged market-wide, not per-contract, for the same reason as
+    futures: a quiet strike can carry an unchanged OI for days for real, so
+    "unchanged" alone never proves the exchange hasn't published yet. Only
+    accept the batch if a majority of comparable RICs actually moved.
+    """
+    if not parquet_path.exists():
+        return 0
+    df = pd.read_parquet(parquet_path)
+    df["date"] = pd.to_datetime(df["date"])
+
+    prior = df[df["date"] < today]
+    if prior.empty:
+        return 0
+    target = prior["date"].max()
+
+    need = df[(df["date"] == target) & df["settle"].notna() & df["oi"].isna()]
+    if need.empty:
+        log.info("OI already complete for %s", target.date())
+        return 0
+
+    rics = sorted(need["ric"].unique())
+    snaps = []
+    for i in range(0, len(rics), PREFILTER_SIZE):
+        batch = rics[i:i + PREFILTER_SIZE]
+        try:
+            snaps.append(ld.get_data(universe=batch, fields=["OPINT_1"]))
+        except Exception as e:
+            log.warning("  OI top-up quote batch failed: %s", str(e)[:120])
+    if not snaps:
+        return 0
+    snap = pd.concat(snaps, ignore_index=True).set_index("Instrument")["OPINT_1"]
+
+    prev_oi = (df[(df["date"] < target) & df["oi"].notna()]
+               .sort_values("date").groupby("ric")["oi"].last())
+
+    comparable = [r for r in rics if pd.notna(prev_oi.get(r)) and pd.notna(snap.get(r))]
+    if not comparable:
+        log.info("OI top-up: no RIC with a prior OI to check the quote against — "
+                 "skipped, left for the historical fetch")
+        return 0
+    moved = [r for r in comparable if abs(float(snap[r]) - float(prev_oi[r])) >= 1]
+    if len(moved) * 2 < len(comparable):
+        log.info("OI top-up: only %d/%d comparable RICs show a changed OI — "
+                 "%s not published yet, left for the next run", len(moved), len(comparable), target.date())
+        return 0
+
+    filled = 0
+    for ric in rics:
+        v = snap.get(ric)
+        if pd.isna(v):
+            continue
+        df.loc[(df["date"] == target) & (df["ric"] == ric), "oi"] = float(v)
+        filled += 1
+    if filled:
+        df["oi"] = df["oi"].astype("Int64")
+        df = df.sort_values(["ric", "date"]).reset_index(drop=True)
+        df.to_parquet(parquet_path, index=False)
+        log.info("OI top-up: filled OI on %s for %d contract(s) (%d/%d comparable moved)",
+                 target.date(), filled, len(moved), len(comparable))
+    return filled
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -415,6 +495,8 @@ def main():
                              "on whatever cadence you run the full sweep.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report universe and coverage, then exit without writing the parquet")
+    parser.add_argument("--no-topup", action="store_true",
+                        help="Skip the post-save real-time-quote OI top-up for the prior session")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -506,7 +588,7 @@ def main():
             log.info("DRY RUN — nothing written.")
             return
 
-        all_dfs, failed_rics = [], []
+        all_dfs, failed_rics, partial_rics = [], [], []
         n_batches = (len(live_rics) + BATCH_SIZE - 1) // BATCH_SIZE
         t0 = time.time()
         for i in range(0, len(live_rics), BATCH_SIZE):
@@ -515,7 +597,19 @@ def main():
             df, definitive = fetch_batch(ld, batch, fetch_start, fetch_end)
             if not df.empty:
                 all_dfs.append(df)
-                log.info("  batch %d/%d: %d rows (%d RICs with data)", b_num, n_batches, len(df), df["ric"].nunique())
+                # A batch can succeed while silently returning fewer RICs than
+                # asked for. Those RICs are not "failed", so without this they
+                # fall through to the upsert, which clears the refresh window
+                # and has nothing to write back — deleting their recent history.
+                # Observed on the sibling commodities: a 09-15 incremental run
+                # added 1,292 rows for 1,812 SB RICs, and CT's next run had to
+                # back-fill 7,174 rows it had lost this way.
+                missing = [r for r in batch if r not in set(df["ric"].unique())]
+                if missing:
+                    partial_rics.extend(missing)
+                log.info("  batch %d/%d: %d rows (%d/%d RICs with data%s)", b_num, n_batches,
+                         len(df), df["ric"].nunique(), len(batch),
+                         f", {len(missing)} not returned — preserved" if missing else "")
             elif definitive:
                 log.info("  batch %d/%d: no data", b_num, n_batches)
             else:
@@ -526,6 +620,9 @@ def main():
         if failed_rics:
             log.warning("%d RICs could not be fetched this run (%d batches); their history is kept as-is.",
                         len(failed_rics), (len(failed_rics) + BATCH_SIZE - 1) // BATCH_SIZE)
+        if partial_rics:
+            log.warning("%d RICs were requested but not returned by an otherwise-successful batch; "
+                        "their existing rows are preserved rather than cleared.", len(partial_rics))
 
         if not all_dfs:
             log.error("No data returned from any batch.")
@@ -559,7 +656,7 @@ def main():
                 # Keep rows outside the refresh window, plus every row belonging to
                 # a RIC whose batch could not be fetched — otherwise a transient
                 # timeout deletes that RIC's window instead of leaving it alone.
-                protect = set(failed_rics) | set(skipped_rics)
+                protect = set(failed_rics) | set(skipped_rics) | set(partial_rics)
                 keep = existing["date"] < window_start
                 if protect:
                     keep = keep | existing["ric"].isin(protect)
@@ -630,6 +727,11 @@ def main():
             tot = last_oi[last_oi["date"] == d_oi]["oi"].sum()
             log.info("Latest OI date: %s | total OI across board: %s lots",
                      d_oi.date(), f"{tot:,}")
+
+        if not args.no_topup:
+            filled = topup_open_interest(ld, PARQUET_PATH)
+            if filled:
+                log.info("OI top-up: %d contract(s) filled for the prior session", filled)
     finally:
         ld.close_session()
 

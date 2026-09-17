@@ -41,6 +41,11 @@ DASH_DIR = Path(__file__).parent.parent / "Dashboard"
 COMMODITY         = "LCC"
 ATM_RIC           = "LCCc1"
 ATM_FIELD         = "SETTLE"
+# Same fix as LRC: true match count (13,980) exceeds LSEG's 10,000-row search
+# cap without an exchange filter, since "startswith(RIC,'LCC')" also matches
+# unrelated instruments. Confirmed live 2026-09-17: ExchangeCode='IEU' (ICE
+# Europe) cuts it to 6,603, safely under.
+EXCHANGE_CODE     = "IEU"
 STRIKE_GAP        = 25
 STRIKE_STEPS      = 40      # ATM +/- 40 -> 81 strikes, +/-1000
 STRIKE_MULTIPLIER = 1       # raw scale, no *100 encoding (confirmed live)
@@ -67,6 +72,8 @@ def main():
                         help="Prefilter to OI>0 only (old behaviour); default also keeps settle-quoted strikes")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report universe and coverage, then exit without writing the parquet")
+    parser.add_argument("--no-topup", action="store_true",
+                        help="Skip the post-save real-time-quote OI top-up for the prior session")
     args = parser.parse_args()
 
     log = c.make_logger("lcc_ingest_lseg", Path(__file__).parent / "logs")
@@ -79,7 +86,8 @@ def main():
         force_full=args.full, use_discovery=not args.legacy_window,
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, ric_prefix=RIC_PREFIX,
-        allowed_months=ALLOWED_MONTHS, atm_field=ATM_FIELD,
+        allowed_months=ALLOWED_MONTHS, atm_field=ATM_FIELD, no_topup=args.no_topup,
+        exchange_code=EXCHANGE_CODE,
     )
 
 

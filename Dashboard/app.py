@@ -50,9 +50,13 @@ def _drilldown(df, key_prefix, title, new_date, min_oi, month_keys):
         d["mk"] = list(zip(d["expiry_month"].astype(int), d["expiry_year"].astype(int)))
         d["Expiry"] = d["mk"].map(col_labels)
         d = d.dropna(subset=["Expiry"])
+        # Sort by the real (year, month) pair, not the formatted "Mon 'YY"
+        # string — string-sorting put Jul/Mar/Nov/Sep before Dec alphabetically
+        # instead of chronologically within a strike.
         return (d.rename(columns={"strike": "Strike"})
+                 .sort_values(["Strike", "expiry_year", "expiry_month"])
                  [["Strike", "Expiry", "OI", "ric"]]
-                 .sort_values(["Strike", "Expiry"]).reset_index(drop=True))
+                 .reset_index(drop=True))
 
     call_flat, put_flat = flat("Call"), flat("Put")
 
@@ -218,6 +222,7 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     cfg = c.render_controls(
         df, atm_val, atm_label, atm_data, key_prefix, title,
         display_step=display_step, mround_default=mround_default, ingest_note=ingest_note,
+        since=min(old_date, new_date),
     )
     min_oi     = cfg["min_oi"]
     custom_atm = cfg["custom_atm"]
@@ -244,13 +249,13 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
     cp_vol = (f"{c_vol/p_vol:.2f}"    if p_vol and not np.isnan(p_vol) and p_vol > 0 and not np.isnan(c_vol) else "—")
 
     items = [
-        ("ATM Price",     f"{custom_atm:,.4g}"),
-        ("Call OI Delta", c._fn(c_oi)),
-        ("Put OI Delta",  c._fn(p_oi)),
-        ("Call Volume",   c._fn(c_vol)),
-        ("Put Volume",    c._fn(p_vol)),
-        ("C/P OI Ratio",  cp_oi),
-        ("C/P Vol Ratio", cp_vol),
+        ("ATM Price",            f"{custom_atm:,.4g}"),
+        ("Call OI Δ (shown)",    c._fn(c_oi)),
+        ("Put OI Δ (shown)",     c._fn(p_oi)),
+        ("Call Volume (shown)",  c._fn(c_vol)),
+        ("Put Volume (shown)",   c._fn(p_vol)),
+        ("C/P OI Ratio",         cp_oi),
+        ("C/P Vol Ratio",        cp_vol),
     ]
     st.markdown(
         '<div style="display:flex;gap:28px;padding:6px 0 12px;border-bottom:1px solid #eee;flex-wrap:wrap">'
@@ -264,15 +269,40 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
         unsafe_allow_html=True
     )
 
+    # The KPIs and the TOT footer are deliberately scoped to the visible grid,
+    # so state what fraction of the board that is. Measured on KC: the default
+    # +/-25 Exact window held 81% of |OI change| and read +5,364 while the
+    # whole board was +3,894 — the wings had moved the other way. Without this
+    # line the headline number reads as a board-wide total.
+    def _abs_sum(p):
+        if p is None or p.empty:
+            return 0.0
+        return float(np.nansum(np.abs(p.to_numpy(dtype=float))))
+
+    shown_abs = _abs_sum(vis["coi"]) + _abs_sum(vis["poi"])
+    board_abs = _abs_sum(call_oi) + _abs_sum(put_oi)
+    n_traded  = len(cfg["all_strikes_data"])
+    if board_abs > 0:
+        cov = shown_abs / board_abs * 100
+        tone = "#888" if cov >= 99 else "#b45309"
+        st.markdown(
+            f'<div style="font-size:10px;color:{tone};padding:0 0 10px">'
+            f'Grid shows <b>{len(rows)}</b> of <b>{n_traded}</b> traded strikes — '
+            f'<b>{cov:.0f}%</b> of board |OI change|. KPIs and TOT are scoped to these rows; '
+            f'raise "Rows ±" to widen.</div>',
+            unsafe_allow_html=True)
+
+    date_range = (f'<span style="font-size:11px;font-weight:400;color:#888">'
+                  f'&nbsp;{old_date.strftime("%d %b")} &rarr; {new_date.strftime("%d %b %Y")}</span>')
     cl, cr = st.columns(2)
     with cl:
-        st.markdown("**OI Change**")
+        st.markdown(f"**OI Change**{date_range}", unsafe_allow_html=True)
         st.markdown(
             c.render_butterfly(call_oi, put_oi, grid, custom_atm, c.oi_color, month_keys,
                                how="sum", fmt="{:.0f}", footer=True, title=title),
             unsafe_allow_html=True)
     with cr:
-        st.markdown("**Volume**")
+        st.markdown(f"**Volume**{date_range}", unsafe_allow_html=True)
         st.markdown(
             c.render_butterfly(call_vol, put_vol, grid, custom_atm, c.vol_color, month_keys,
                                how="sum", fmt="{:.0f}", footer=True, title=title),
@@ -329,12 +359,10 @@ def render_commodity_tab(df, atm_val, atm_label, old_date, new_date,
 
 
 # ── Main layout ────────────────────────────────────────────────────────────────
-st.title("Options Dashboard")
-st.caption(
-    f"Old Date: **{old_date.strftime('%d %b %Y')}**  |  "
-    f"New Date: **{new_date.strftime('%d %b %Y')}**  |  "
-    f"Advanced analytics (Px Change, Vol Surface, IV vs RV) → run `oi_advanced_analytics.py`"
-)
+# No page title/caption here by design — old/new date and other run context
+# are shown inline next to the specific panel they apply to (Controls caption,
+# OI Change/Volume headers) instead of a fixed banner, so the vertical space
+# goes to data instead of a repeated header on every tab.
 
 tabs = st.tabs([cm["tab_label"] for cm in c.COMMODITIES])
 
