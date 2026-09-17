@@ -20,7 +20,16 @@ import common as c
 st.set_page_config(page_title="Options Dashboard", layout="wide")
 
 dfs, atm_data = c.load_core_data()
-old_date, new_date = c.render_sidebar(dfs, title="Options Dashboard")
+
+# Read the commodity picker's PREVIOUS selection (session_state already holds
+# it from last run, before the widget itself is (re)created further down) so
+# the sidebar can default New Date to that specific commodity's own latest OI
+# date. Falls back to KC/Arabica, matching the segmented_control's own default
+# on first load before any selection has been made.
+_label_to_key = {cm["tab_label"]: cm["key"] for cm in c.COMMODITIES}
+_active_key = _label_to_key.get(st.session_state.get("active_commodity"), "KC")
+
+old_date, new_date = c.render_sidebar(dfs, title="Options Dashboard", active_key=_active_key)
 
 MAX_DRILL = 8  # distinct colors available for overlaid series
 

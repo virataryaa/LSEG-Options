@@ -159,8 +159,17 @@ def latest_oi_date(df: pd.DataFrame, on_or_before=None):
     return ds[-1] if ds else None
 
 
-def render_sidebar(dfs, title="Options Dashboard"):
-    """Shared Old Date / New Date picker + latest-data status. Returns (old_date, new_date)."""
+def render_sidebar(dfs, title="Options Dashboard", active_key=None):
+    """Shared Old Date / New Date picker + latest-data status. Returns (old_date, new_date).
+
+    active_key: the currently-selected commodity (e.g. "SB"). When given, New
+    Date defaults to — and jumps to, on every commodity switch — THAT
+    commodity's own latest OI date rather than the newest OI date across all
+    six. Different commodities routinely have different latest-OI dates (one
+    paused a day, one on a different settle cycle), so a shared global default
+    could silently land you on a date with no OI for the commodity you just
+    switched to.
+    """
     all_dates = set()
     for _df in dfs.values():
         if not _df.empty:
@@ -178,23 +187,40 @@ def render_sidebar(dfs, title="Options Dashboard"):
         st.error("No option data could be loaded. Check that Database/*.parquet files exist.")
         st.stop()
 
-    # Default New Date to the newest date that has OI somewhere, so the app
-    # lands on a view that actually renders instead of an all-blank table.
-    oi_any = set()
-    for _df in dfs.values():
-        oi_any.update(oi_dates(_df))
+    # Default New Date to the newest date that has OI — scoped to the active
+    # commodity when known, otherwise the newest across all six (first load,
+    # before any commodity has been picked).
+    active_df = dfs.get(active_key) if active_key else None
+    if active_df is not None and not active_df.empty:
+        oi_any = set(oi_dates(active_df))
+    else:
+        oi_any = set()
+        for _df in dfs.values():
+            oi_any.update(oi_dates(_df))
     default_new = max(oi_any) if oi_any else available_dates[-1]
     default_new_idx = (available_dates.index(default_new)
                        if default_new in available_dates else len(available_dates) - 1)
+
+    # Seed/override the New Date widget's session_state directly rather than
+    # via `index=` — Streamlit warns (and `index` is silently ignored anyway)
+    # if a widget's value is set via session_state in the same run it's first
+    # given an `index`. Seeded once on first-ever load, then re-seeded only
+    # when the active commodity actually changes, so a manual pick by the
+    # user in between is left alone.
+    if "new_date_sel" not in st.session_state:
+        st.session_state["new_date_sel"] = default_new
+    elif active_key and st.session_state.get("_sidebar_prev_commodity") != active_key:
+        if default_new in available_dates:
+            st.session_state["new_date_sel"] = default_new
+    st.session_state["_sidebar_prev_commodity"] = active_key
 
     with st.sidebar:
         st.title(title)
         st.divider()
         old_date = st.selectbox("Old Date", available_dates,
-                                 index=max(0, default_new_idx - 9),
+                                 index=max(0, default_new_idx - 9), key="old_date_sel",
                                  format_func=lambda d: d.strftime("%d %b %Y"))
-        new_date = st.selectbox("New Date", available_dates,
-                                 index=max(0, default_new_idx),
+        new_date = st.selectbox("New Date", available_dates, key="new_date_sel",
                                  format_func=lambda d: d.strftime("%d %b %Y"))
         if old_date == new_date:
             st.warning("Old Date and New Date are the same.")
