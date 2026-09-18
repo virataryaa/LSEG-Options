@@ -241,10 +241,26 @@ def render_sidebar(dfs, title="Options Dashboard", active_key=None):
             else:
                 st.caption(f"{_label} — no data")
 
-        st.divider()
-        st.caption("Advanced analytics (Px Change, Vol Surface, IV vs RV) → `oi_advanced_analytics.py`")
-
     return old_date, new_date
+
+
+def render_view_toggle() -> str:
+    """Sidebar Basic / Advanced Analytics switch.
+
+    Merged from the standalone oi_advanced_analytics.py, which existed only
+    to keep the main app fast by NOT loading futures data or computing
+    ImpVol/RV panels. That's preserved here structurally instead of by a
+    separate file: Advanced mode's extra data load and computation only
+    happen when this returns "Advanced Analytics" — left on "Basic" (the
+    default), the app behaves exactly as before this merge, byte-for-byte
+    the same code path, zero added cost.
+    """
+    with st.sidebar:
+        st.divider()
+        view = st.radio("View", ["Basic", "Advanced Analytics"], key="view_mode",
+                        help="Advanced Analytics adds Px Change, Vol Surface, and IV vs RV — "
+                             "loads futures data and computes more, only when selected.")
+    return view
 
 
 # ── Pivot helpers (all parameterised) ─────────────────────────────────────────
