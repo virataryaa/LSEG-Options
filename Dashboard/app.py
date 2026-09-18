@@ -552,8 +552,14 @@ def render_advanced_tab(df, atm_val, atm_label, old_date, new_date,
                         exp_to_fut = {}
                         for _, r in unique_exp.iterrows():
                             em, ey = int(r.expiry_month), int(r.expiry_year)
-                            fm = next((m for m in fut_month_ints if m >= em), fut_month_ints[0])
-                            fy = ey if any(m >= em for m in fut_month_ints) else ey + 1
+                            # fut_month_ints can be empty if a futures parquet exists
+                            # but every row has an unmapped/unrecognized month code
+                            # (load_fut only drops nulls on settlement, not month_int)
+                            # — fut_month_ints[0] as a bare default would crash the
+                            # whole tab in that case instead of degrading gracefully.
+                            fm = next((m for m in fut_month_ints if m >= em),
+                                     fut_month_ints[0] if fut_month_ints else em)
+                            fy = ey if (fut_month_ints and any(m >= em for m in fut_month_ints)) else ey + 1
                             exp_to_fut[(em, ey)] = (fm, fy)
                         sub["_fut_m"] = sub.apply(lambda r: exp_to_fut.get(
                             (int(r.expiry_month), int(r.expiry_year)), (None, None))[0], axis=1)
@@ -722,8 +728,14 @@ def render_advanced_tab(df, atm_val, atm_label, old_date, new_date,
                         exp_to_fut = {}
                         for _, r in unique_exp.iterrows():
                             em, ey = int(r.expiry_month), int(r.expiry_year)
-                            fm = next((m for m in fut_month_ints if m >= em), fut_month_ints[0])
-                            fy = ey if any(m >= em for m in fut_month_ints) else ey + 1
+                            # fut_month_ints can be empty if a futures parquet exists
+                            # but every row has an unmapped/unrecognized month code
+                            # (load_fut only drops nulls on settlement, not month_int)
+                            # — fut_month_ints[0] as a bare default would crash the
+                            # whole tab in that case instead of degrading gracefully.
+                            fm = next((m for m in fut_month_ints if m >= em),
+                                     fut_month_ints[0] if fut_month_ints else em)
+                            fy = ey if (fut_month_ints and any(m >= em for m in fut_month_ints)) else ey + 1
                             exp_to_fut[(em, ey)] = (fm, fy)
                         sub_ts["_fut_m"] = sub_ts.apply(
                             lambda r: exp_to_fut.get((int(r.expiry_month), int(r.expiry_year)), (None, None))[0], axis=1)
@@ -817,8 +829,12 @@ def render_advanced_tab(df, atm_val, atm_label, old_date, new_date,
                 exp_to_fut_rv = {}
                 for _, r in unique_exp_rv.iterrows():
                     em, ey = int(r.expiry_month), int(r.expiry_year)
-                    fm = next((m for m in fut_month_ints if m >= em), fut_month_ints[0])
-                    fy = ey if any(m >= em for m in fut_month_ints) else ey + 1
+                    # Same empty-fut_month_ints guard as the Vol Surface tab above —
+                    # a bare fut_month_ints[0] default would crash instead of
+                    # degrading (settlement already falls back to custom_atm below).
+                    fm = next((m for m in fut_month_ints if m >= em),
+                             fut_month_ints[0] if fut_month_ints else em)
+                    fy = ey if (fut_month_ints and any(m >= em for m in fut_month_ints)) else ey + 1
                     exp_to_fut_rv[(em, ey)] = (fm, fy)
                 sub_rv["_fut_m"] = sub_rv.apply(
                     lambda r: exp_to_fut_rv.get((int(r.expiry_month), int(r.expiry_year)), (None, None))[0], axis=1)
