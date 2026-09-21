@@ -181,11 +181,33 @@ _TH = ('padding:6px 10px;border:1px solid #ccc;background:#2a2a2a;color:#fff;'
 _TD = 'padding:6px 10px;border:1px solid #ccc;font-size:12px;white-space:nowrap;'
 
 
-def build_status_table_html(ran_this_run: set) -> str:
+def _topup_status(out: str) -> tuple:
+    """Reads the actual "OI top-up: ..." line each ingest script logs and
+    classifies it, rather than inferring from the parquet's latest-OI date —
+    a 1-day OI lag looks identical whether top-up wasn't attempted this run,
+    was attempted and correctly held back (majority-moved gate), or the
+    commodity simply didn't run this session at all."""
+    if "OI top-up: filled OI on" in out:
+        return ("Filled", "#3c7a41")
+    if "not published yet" in out:
+        return ("Held (not published)", "#b4590c")
+    if "no RIC with a prior OI" in out:
+        return ("No baseline", "#888")
+    if "OI already complete" in out:
+        return ("Already complete", "#3c7a41")
+    if "OI top-up quote" in out and "failed" in out:
+        return ("Quote fetch failed", "#a3271f")
+    return ("&mdash;", "#888")
+
+
+def build_status_table_html(ran_this_run: set, results: dict = None) -> str:
     """Full 6-commodity status table: fields x commodities, latest date per field.
     `ran_this_run` marks which commodities this specific run touched, so the
     recipient can tell fresh-this-run rows from carried-over ones at a glance.
+    `results` (key -> (ok, out)) lets the OI Top-up column show what actually
+    happened this run for commodities that were attempted.
     """
+    results = results or {}
     rows_html = []
     for key, (_script, parquet, group) in ALL_COMMODITIES.items():
         s = _commodity_snapshot(key, parquet)
@@ -194,7 +216,7 @@ def build_status_table_html(ran_this_run: set) -> str:
         if not s["ok"]:
             rows_html.append(
                 f'<tr style="background:{name_bg}"><td style="{_TD}"><b>{key}</b> ({group})</td>'
-                f'<td style="{_TD};color:#a3271f" colspan="9">{s.get("note","no data")}</td></tr>')
+                f'<td style="{_TD};color:#a3271f" colspan="10">{s.get("note","no data")}</td></tr>')
             continue
         stale = s["stale_days"]
         status = ("OK" if stale <= 1 else
@@ -202,6 +224,10 @@ def build_status_table_html(ran_this_run: set) -> str:
                    f"{stale}d STALE — needs --full")
         status_color = "#3c7a41" if stale <= 1 else ("#b4590c" if stale <= 10 else "#a3271f")
         ran_tag = " &#9679;" if ran else ""
+        if key in results:
+            topup_label, topup_color = _topup_status(results[key][1])
+        else:
+            topup_label, topup_color = ("not run this session", "#aaa")
         rows_html.append(
             '<tr style="background:%s">'
             '<td style="%s"><b>%s</b>%s</td><td style="%s">%s</td>'
@@ -210,6 +236,7 @@ def build_status_table_html(ran_this_run: set) -> str:
             '<td style="%s">%s</td><td style="%s">%s</td>'
             '<td style="%s">%s%%</td>'
             '<td style="%scolor:%s"><b>%s</b></td>'
+            '<td style="%scolor:%s">%s</td>'
             '</tr>' % (
                 name_bg,
                 _TD, key, ran_tag, _TD, group,
@@ -218,11 +245,12 @@ def build_status_table_html(ran_this_run: set) -> str:
                 _TD, s["last"], _TD, s["oi_date"] or "&mdash;",
                 _TD, s["ivpct"],
                 _TD, status_color, status,
+                _TD, topup_color, topup_label,
             ))
 
     header = ''.join(f'<th style="{_TH}">{h}</th>' for h in
                       ["Commodity", "Group", "Rows", "Calls/Puts", "Expiries",
-                       "Strike range", "Latest data", "Latest OI", "ImpVol", "Status"])
+                       "Strike range", "Latest data", "Latest OI", "ImpVol", "Status", "OI Top-up"])
     return (
         '<p style="font-family:Calibri,Arial,sans-serif;font-size:13px;color:#333;margin:0 0 10px">'
         '&#9679; = refreshed in this run</p>'
@@ -234,7 +262,7 @@ def build_status_table_html(ran_this_run: set) -> str:
 def build_email_html(group_label: str, today: str, fut_ok: bool, fut_out: str,
                      results: dict, pushed: bool, git_out: str) -> str:
     f = "font-family:Calibri,Arial,sans-serif"
-    table = build_status_table_html(set(results.keys()))
+    table = build_status_table_html(set(results.keys()), results)
 
     detail_blocks = []
     for label, (ok, out) in results.items():
