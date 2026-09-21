@@ -36,6 +36,11 @@ MONTHS_FORWARD    = 12
 BACKFILL_DAYS     = 90
 ROLLING_DAYS      = 10
 BATCH_SIZE        = 50
+# CC lists strikes 3x+ the current price away from ATM — confirmed live
+# 2026-09-21: strikes within +/-100% of ATM already capture 95%+ of total
+# open interest (237 -> 164 strikes, losing <5% of OI). Caps real rate-limit
+# cost from deep wings nobody is actually positioned in.
+MAX_STRIKE_PCT    = 100
 
 PARQUET_PATH = DB_DIR / "CC_options_ice.parquet"
 ATM_JSON     = DASH_DIR / "atm.json"
@@ -71,7 +76,7 @@ def main():
         force_full=args.full, use_discovery=not args.legacy_window,
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, no_topup=args.no_topup,
-        active_only=args.active_only,
+        active_only=args.active_only, max_strike_pct=MAX_STRIKE_PCT,
     )
 
 

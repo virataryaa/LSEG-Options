@@ -55,6 +55,10 @@ MONTHS_FORWARD    = 6       # ~5 expiries/year -> a bit over a year forward
 BACKFILL_DAYS     = 90
 ROLLING_DAYS      = 10
 BATCH_SIZE        = 50
+# LCC lists strikes 3x+ the current price away from ATM — confirmed live
+# 2026-09-21: strikes within +/-100% of ATM already capture 95%+ of total
+# open interest (260 -> 236 strikes). Same reasoning as CC.
+MAX_STRIKE_PCT    = 100
 
 PARQUET_PATH = DB_DIR / "LCC_options_ice.parquet"
 ATM_JSON     = DASH_DIR / "atm.json"
@@ -92,6 +96,7 @@ def main():
         dry_run=args.dry_run, days=args.days, ric_prefix=RIC_PREFIX,
         allowed_months=ALLOWED_MONTHS, atm_field=ATM_FIELD, no_topup=args.no_topup,
         exchange_code=EXCHANGE_CODE, active_only=args.active_only,
+        max_strike_pct=MAX_STRIKE_PCT,
     )
 
 

@@ -461,7 +461,7 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
                 use_discovery: bool = True, include_weeklies: bool = False,
                 require_oi: bool = False, dry_run: bool = False, days: int = None,
                 no_topup: bool = False, exchange_code: str = None, active_only: bool = False,
-                max_expiries: int = None):
+                max_expiries: int = None, max_strike_pct: float = None):
     """Shared main-loop body. Returns the final DataFrame written to parquet.
     ric_prefix: '1' for KC/CC/SB/CT-style RICs, '' for LRC/LCC (root is already
     unambiguous, no disambiguator prefix — confirmed live via discovery.search).
@@ -513,6 +513,23 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
             if len(uniq_exp) > max_expiries:
                 log.info("MAX-EXPIRIES: kept nearest %d of %d listed expiries (%d -> %d candidate RICs)",
                          max_expiries, len(uniq_exp), before, len(meta))
+
+        if max_strike_pct:
+            # Same idea as max_expiries, for the strike axis. Checked live
+            # 2026-09-21: CC and LCC both list strikes 3x+ the current price
+            # away from ATM, but strikes within +/-100% of ATM already
+            # capture 95%+ of total open interest for every commodity — the
+            # far wings cost real RICs (CC: 237->164, cutting 73 for <5% of
+            # OI) for strikes nobody is actually positioned in.
+            lo, hi = atm * (1 - max_strike_pct / 100), atm * (1 + max_strike_pct / 100)
+            before = len(meta)
+            n_strikes_before = meta["strike"].nunique()
+            meta = meta[(meta["strike"] >= lo) & (meta["strike"] <= hi)].reset_index(drop=True)
+            if meta["strike"].nunique() < n_strikes_before:
+                log.info("MAX-STRIKE-PCT: kept strikes within +/-%.0f%% of ATM (%s-%s) — "
+                         "%d -> %d distinct strikes, %d -> %d candidate RICs",
+                         max_strike_pct, round(lo, 4), round(hi, 4),
+                         n_strikes_before, meta["strike"].nunique(), before, len(meta))
 
         all_rics = meta["ric"].tolist()
         log.info("ATM (%s): %s | candidate RICs: %d | strikes %g-%g (%d distinct) | expiries: %d",
