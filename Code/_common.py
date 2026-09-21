@@ -460,7 +460,8 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
                 ric_prefix: str = "1", allowed_months: set = None, atm_field: str = "TRDPRC_1",
                 use_discovery: bool = True, include_weeklies: bool = False,
                 require_oi: bool = False, dry_run: bool = False, days: int = None,
-                no_topup: bool = False, exchange_code: str = None, active_only: bool = False):
+                no_topup: bool = False, exchange_code: str = None, active_only: bool = False,
+                max_expiries: int = None):
     """Shared main-loop body. Returns the final DataFrame written to parquet.
     ric_prefix: '1' for KC/CC/SB/CT-style RICs, '' for LRC/LCC (root is already
     unambiguous, no disambiguator prefix — confirmed live via discovery.search).
@@ -496,6 +497,22 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
             meta    = build_meta(commodity, strikes, months, strike_multiplier, ric_prefix)
             log.info("ATM (%s): %s | legacy window strikes %s-%s (%d) x %d months",
                      atm_ric, atm, strikes[0], strikes[-1], len(strikes), len(months))
+
+        if max_expiries:
+            # Applied BEFORE prefilter/fetch, not just at display time — a
+            # commodity that genuinely lists 2-3 years forward (Cotton: 24
+            # distinct expiries out to mid-2029 vs KC's 9) pays the full
+            # per-RIC rate-limit cost for every one of those far-dated
+            # expiries unless trimmed here, even though nobody's looking
+            # at a 3-year-out serial strike day to day.
+            uniq_exp = (meta[["expiry_year", "expiry_month"]].drop_duplicates()
+                        .sort_values(["expiry_year", "expiry_month"]))
+            keep_exp = set(map(tuple, uniq_exp.head(max_expiries).to_numpy()))
+            before = len(meta)
+            meta = meta[meta.apply(lambda r: (r["expiry_year"], r["expiry_month"]) in keep_exp, axis=1)].reset_index(drop=True)
+            if len(uniq_exp) > max_expiries:
+                log.info("MAX-EXPIRIES: kept nearest %d of %d listed expiries (%d -> %d candidate RICs)",
+                         max_expiries, len(uniq_exp), before, len(meta))
 
         all_rics = meta["ric"].tolist()
         log.info("ATM (%s): %s | candidate RICs: %d | strikes %g-%g (%d distinct) | expiries: %d",

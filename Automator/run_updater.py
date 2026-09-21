@@ -1,66 +1,29 @@
 """
-run_updater.py — Options (LSEG interim migration) daily automator
-Runs all four commodities (KC/CC/SB/CT) sequentially, mirroring
-ICEBREAKER/Options/Automator/run.py's structure (commit/push/email shape).
-Each commodity's ingest is independent — one failing doesn't stop the rest,
-but any failure marks the whole run as failed for the email subject/exit code.
+run_updater.py — RETIRED. Do not use.
+
+This was the original single all-6-commodity automator. It was replaced by
+run_london.py (LRC/LCC, ~12:30pm) and run_nyc.py (KC/SB/CT/CC, ~4:10pm),
+which share _automator_common.py and pass --active-only on every commodity.
+
+Found live 2026-09-21: the OLD scheduled task pointing at this file (via
+run.bat) was never disabled, so it has been firing on its own schedule
+EVERY DAY since the split, right alongside the two new automators —
+meaning every commodity was being fetched via TWO separate full runs a
+day, with this one never getting the --active-only trim. That is a very
+plausible major contributor to the LSEG rate-limit exhaustion this
+project hit starting 2026-09-17.
+
+This file now does nothing but log that it was invoked and exit
+immediately, so if the old Task Scheduler entry is still active, it can
+no longer hit LSEG at all. FIND AND DELETE (or disable) THE SCHEDULED
+TASK POINTING AT run.bat — this stub only stops the API calls, it does
+not stop the wasted daily task-scheduler slot.
 """
 
-import shutil
-import subprocess
-import sys
-import time
 import datetime
-import traceback
 from pathlib import Path
 
-import win32com.client
-
-ROOT     = Path(__file__).resolve().parent.parent
-CODE_DIR = ROOT / "Code"
 LOG_FILE = Path(__file__).resolve().parent / "run_log.txt"
-PYTHON   = sys.executable
-
-# All 6 re-enabled now that the 429-backoff and OI top-up fixes (proven on
-# KC first) are ported into _common.py, which CC/SB/CT/LRC/LCC all share.
-#
-# Ordered smallest-universe-first (LRC 140 RICs .. CC ~2,900), not
-# alphabetically. The 09-15 run's 429s were a cumulative request-volume
-# problem on the local Workspace proxy, not a per-commodity one — CT (5th)
-# started throttling and LRC/LCC (6th/7th) failed outright with zero data
-# because the budget was already exhausted by the time their turn came.
-# Running the cheapest universes first means a full order-of-magnitude
-# smaller commodity is never the one starved by commodities that ran before
-# it, and COOLDOWN_SECONDS below gives the proxy's rate window a chance to
-# reset between each one.
-COMMODITIES = {
-    "KC":  (CODE_DIR / "kc_ingest_lseg.py",  ROOT / "Database" / "KC_options_ice.parquet"),
-    "LRC": (CODE_DIR / "lrc_ingest_lseg.py", ROOT / "Database" / "LRC_options_ice.parquet"),
-    "LCC": (CODE_DIR / "lcc_ingest_lseg.py", ROOT / "Database" / "LCC_options_ice.parquet"),
-    "SB":  (CODE_DIR / "sb_ingest_lseg.py",  ROOT / "Database" / "SB_options_ice.parquet"),
-    "CT":  (CODE_DIR / "ct_ingest_lseg.py",  ROOT / "Database" / "CT_options_ice.parquet"),
-    "CC":  (CODE_DIR / "cc_ingest_lseg.py",  ROOT / "Database" / "CC_options_ice.parquet"),
-}
-COOLDOWN_SECONDS = 60  # pause between commodities to let the rate-limit window reset
-ATM_JSON = ROOT / "Dashboard" / "atm.json"
-
-# Daily-refreshed master Futures database (separate migration, its own
-# automator keeps it current every morning) — synced in here for the
-# Dashboard's per-expiry ATM anchor (Vol Term Structure panel). Source
-# uses "rc" for Robusta; Options RICs use "LRC", so that one is renamed
-# on copy — everything else copies straight across.
-FUTURES_SRC = Path(r"C:\Users\virat.arya\ETG\SoftsDatabase - Documents\Database\Hardmine\LSEG\Futures\Database")
-FUTURES_DST = ROOT / "Database" / "Futures"
-FUTURES_MAP = {
-    "kc_futures.parquet":  "kc_futures.parquet",
-    "cc_futures.parquet":  "cc_futures.parquet",
-    "sb_futures.parquet":  "sb_futures.parquet",
-    "ct_futures.parquet":  "ct_futures.parquet",
-    "lcc_futures.parquet": "lcc_futures.parquet",
-    "rc_futures.parquet":  "lrc_futures.parquet",
-}
-
-EMAIL_TO = "virat.arya@etgworld.com"
 
 
 def log(msg: str):
@@ -71,115 +34,10 @@ def log(msg: str):
         f.write(line + "\n")
 
 
-def send_email(subject: str, body: str):
-    try:
-        ol   = win32com.client.Dispatch("Outlook.Application")
-        mail = ol.CreateItem(0)
-        mail.To      = EMAIL_TO
-        mail.Subject = subject
-        mail.Body    = body
-        mail.Send()
-        log("Email sent.")
-    except Exception as e:
-        log(f"Email failed: {e}")
-
-
-def sync_futures() -> tuple[bool, str]:
-    FUTURES_DST.mkdir(parents=True, exist_ok=True)
-    lines = []
-    ok = True
-    for src_name, dst_name in FUTURES_MAP.items():
-        src = FUTURES_SRC / src_name
-        dst = FUTURES_DST / dst_name
-        if not src.exists():
-            lines.append(f"  MISSING: {src}")
-            ok = False
-            continue
-        shutil.copy2(src, dst)
-        lines.append(f"  {src_name} -> {dst_name}")
-    return ok, "\n".join(lines)
-
-
-def run_ingest(script: Path, label: str) -> tuple[bool, str]:
-    log(f"Running {label} ingest...")
-    result = subprocess.run([PYTHON, str(script)], capture_output=True, text=True)
-    output = result.stdout + result.stderr
-    # Unlike the ICE source, kc_ingest_lseg.py sys.exit(1)s on genuine failure
-    # (no live RICs, no data returned) rather than silently exiting 0 with
-    # "nothing to save" — so returncode==0 here is actually a reliable signal.
-    return result.returncode == 0, output
-
-
-def git_push(files: list[Path]) -> tuple[bool, str]:
-    rel = [str(f.relative_to(ROOT)) for f in files if f.exists()]
-    if not rel:
-        return False, "No files to stage"
-    cmds = [
-        ["git", "add"] + rel,
-        ["git", "commit", "-m", f"auto: daily options update (LSEG) {datetime.date.today()}"],
-        ["git", "push"],
-    ]
-    out = ""
-    for cmd in cmds:
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT))
-        out += r.stdout + r.stderr
-        if r.returncode != 0 and "nothing to commit" not in r.stderr:
-            return False, out
-    return True, out
-
-
-def main():
-    today = datetime.date.today().isoformat()
-    log("=" * 50)
-    log(f"Options ingest (LSEG) started — {today}")
-
-    fut_ok, fut_out = sync_futures()
-    log(f"Futures sync: {'OK' if fut_ok else 'PARTIAL/FAILED'}")
-    for line in fut_out.splitlines():
-        log(f"  {line}")
-
-    results = {}
-    any_failed = False
-    labels = list(COMMODITIES.items())
-    for idx, (label, (script, _parquet)) in enumerate(labels):
-        if idx > 0:
-            log(f"Cooldown {COOLDOWN_SECONDS}s before {label} (let the rate-limit window reset)...")
-            time.sleep(COOLDOWN_SECONDS)
-        ok, out = run_ingest(script, label)
-        results[label] = (ok, out)
-        log(f"{label} ingest: {'OK' if ok else 'FAILED'}")
-        for line in out.strip().splitlines():
-            log(f"  {line}")
-        if not ok:
-            any_failed = True
-
-    futures_files = [FUTURES_DST / name for name in FUTURES_MAP.values()]
-    files_to_push = [p for _s, p in COMMODITIES.values()] + [ATM_JSON] + futures_files
-    pushed, git_out = git_push(files_to_push)
-    log("Git push: OK" if pushed else "Git push: FAILED (may be nothing new)")
-    for line in git_out.strip().splitlines():
-        log(f"  {line}")
-
-    body_parts = [f"Options ingest (LSEG) completed — {today}\n",
-                  f"=== Futures sync ({'OK' if fut_ok else 'PARTIAL/FAILED'}) ===\n{fut_out}\n"]
-    for label, (ok, out) in results.items():
-        body_parts.append(f"=== {label} ({'OK' if ok else 'FAILED'}) ===\n{out.strip()}\n")
-    body_parts.append(f"Git: {'pushed' if pushed else 'nothing new / failed'}\n{git_out.strip()}")
-    body = "\n".join(body_parts)
-
-    subject = f"[LSEG Options] {'PARTIAL FAIL' if any_failed else 'OK'} {today}"
-    send_email(subject, body)
-    log("Done.")
-
-    if any_failed:
-        sys.exit(1)
-
-
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        msg = traceback.format_exc()
-        log(f"UNHANDLED ERROR:\n{msg}")
-        send_email(f"[LSEG Options] CRASHED {datetime.date.today()}", msg)
-        sys.exit(1)
+    log("=" * 50)
+    log("run_updater.py was invoked but is RETIRED — doing nothing, no LSEG calls made.")
+    log("This means a scheduled task still points at run.bat / run_updater.py.")
+    log("Find it in Task Scheduler and delete/disable it — use run_london.bat "
+        "(~12:30pm) and run_nyc.bat (~4:10pm) instead.")
+    log("=" * 50)

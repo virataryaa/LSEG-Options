@@ -32,6 +32,12 @@ MONTHS_FORWARD    = 12
 BACKFILL_DAYS     = 90
 ROLLING_DAYS      = 10
 BATCH_SIZE        = 50
+# Cotton genuinely lists far more forward expiries than the other softs —
+# confirmed live 2026-09-21: 24 distinct expiries out to Jul 2029, vs KC's 9.
+# Nobody's trading a strike 3 years out day to day, and every extra expiry
+# is more RICs fetched (more rate-limit exposure) for no practical benefit.
+# Capped to the nearest 9, matching KC's typical listed depth.
+MAX_EXPIRIES      = 9
 
 PARQUET_PATH = DB_DIR / "CT_options_ice.parquet"
 ATM_JSON     = DASH_DIR / "atm.json"
@@ -67,7 +73,7 @@ def main():
         force_full=args.full, use_discovery=not args.legacy_window,
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, no_topup=args.no_topup,
-        active_only=args.active_only,
+        active_only=args.active_only, max_expiries=MAX_EXPIRIES,
     )
 
 
