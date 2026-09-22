@@ -59,6 +59,8 @@ BATCH_SIZE        = 50
 # 2026-09-21: strikes within +/-100% of ATM already capture 95%+ of total
 # open interest (260 -> 236 strikes). Same reasoning as CC.
 MAX_STRIKE_PCT    = 100
+# Hard cap on strike count, nearest to ATM — tighter than MAX_STRIKE_PCT alone.
+MAX_STRIKES       = 100
 
 PARQUET_PATH = DB_DIR / "LCC_options_ice.parquet"
 ATM_JSON     = DASH_DIR / "atm.json"
@@ -96,7 +98,7 @@ def main():
         dry_run=args.dry_run, days=args.days, ric_prefix=RIC_PREFIX,
         allowed_months=ALLOWED_MONTHS, atm_field=ATM_FIELD, no_topup=args.no_topup,
         exchange_code=EXCHANGE_CODE, active_only=args.active_only,
-        max_strike_pct=MAX_STRIKE_PCT,
+        max_strike_pct=MAX_STRIKE_PCT, max_strikes=MAX_STRIKES,
     )
 
 

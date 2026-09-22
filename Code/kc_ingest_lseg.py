@@ -106,6 +106,7 @@ PREFILTER_SIZE = 100
 FETCH_RETRIES  = 3             # transient LSEG timeouts are common on wide universes
 FETCH_BACKOFF  = 5             # seconds, doubled per retry
 ACTIVE_LOOKBACK = 10           # days of OI/volume history that make a RIC "active"
+MAX_STRIKES     = 100          # hard cap on strike count, nearest to ATM kept (rate-limit control)
 
 # Measured cost model (2026-08-26). lseg.data does NOT batch get_history: it
 # issues one HTTP request per RIC to the local Workspace proxy, so wall time is
@@ -529,6 +530,20 @@ def main():
             meta    = build_meta(strikes, months)
             log.info("ATM (%s): %s | legacy window strikes %s-%s (%d) x %d months",
                      ATM_RIC, atm, strikes[0], strikes[-1], len(strikes), len(months))
+
+        if MAX_STRIKES:
+            # Hard cap on strike COUNT, centered on ATM — same mechanism as
+            # _common.py's max_strikes for the other 5 commodities, kept here
+            # too since KC's ingest logic stands alone.
+            uniq_strikes = meta["strike"].drop_duplicates()
+            n_strikes_before = len(uniq_strikes)
+            if n_strikes_before > MAX_STRIKES:
+                nearest = uniq_strikes.iloc[(uniq_strikes - atm).abs().argsort()[:MAX_STRIKES]]
+                keep_strikes = set(nearest)
+                before = len(meta)
+                meta = meta[meta["strike"].isin(keep_strikes)].reset_index(drop=True)
+                log.info("Only keeping the %d strikes closest to the current price (%s) — %d -> %d candidate contracts",
+                         MAX_STRIKES, atm, before, len(meta))
 
         all_rics = meta["ric"].tolist()
         log.info("Current price: %s | Found %d possible contracts (%d strike prices, %d expiry dates)",

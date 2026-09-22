@@ -38,6 +38,9 @@ BATCH_SIZE        = 50
 # is more RICs fetched (more rate-limit exposure) for no practical benefit.
 # Capped to the nearest 9, matching KC's typical listed depth.
 MAX_EXPIRIES      = 9
+# Hard cap on strike count, nearest to ATM kept — same rate-limit control
+# applied across all 6 commodities.
+MAX_STRIKES       = 100
 
 PARQUET_PATH = DB_DIR / "CT_options_ice.parquet"
 ATM_JSON     = DASH_DIR / "atm.json"
@@ -73,7 +76,7 @@ def main():
         force_full=args.full, use_discovery=not args.legacy_window,
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, no_topup=args.no_topup,
-        active_only=args.active_only, max_expiries=MAX_EXPIRIES,
+        active_only=args.active_only, max_expiries=MAX_EXPIRIES, max_strikes=MAX_STRIKES,
     )
 
 

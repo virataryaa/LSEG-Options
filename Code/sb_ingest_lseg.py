@@ -32,6 +32,9 @@ MONTHS_FORWARD    = 12
 BACKFILL_DAYS     = 90
 ROLLING_DAYS      = 10
 BATCH_SIZE        = 50
+# Hard cap on strike count, nearest to ATM kept — same rate-limit control
+# applied across all 6 commodities.
+MAX_STRIKES       = 100
 
 PARQUET_PATH = DB_DIR / "SB_options_ice.parquet"
 ATM_JSON     = DASH_DIR / "atm.json"
@@ -67,7 +70,7 @@ def main():
         force_full=args.full, use_discovery=not args.legacy_window,
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, no_topup=args.no_topup,
-        active_only=args.active_only,
+        active_only=args.active_only, max_strikes=MAX_STRIKES,
     )
 
 

@@ -461,7 +461,7 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
                 use_discovery: bool = True, include_weeklies: bool = False,
                 require_oi: bool = False, dry_run: bool = False, days: int = None,
                 no_topup: bool = False, exchange_code: str = None, active_only: bool = False,
-                max_expiries: int = None, max_strike_pct: float = None):
+                max_expiries: int = None, max_strike_pct: float = None, max_strikes: int = None):
     """Shared main-loop body. Returns the final DataFrame written to parquet.
     ric_prefix: '1' for KC/CC/SB/CT-style RICs, '' for LRC/LCC (root is already
     unambiguous, no disambiguator prefix — confirmed live via discovery.search).
@@ -530,6 +530,23 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
                          "%d -> %d distinct strikes, %d -> %d candidate RICs",
                          max_strike_pct, round(lo, 4), round(hi, 4),
                          n_strikes_before, meta["strike"].nunique(), before, len(meta))
+
+        if max_strikes:
+            # Hard cap on strike COUNT, centered on ATM — distinct from
+            # max_strike_pct (a percentage band): this keeps exactly the N
+            # strikes nearest to the current price regardless of how the
+            # board is shaped, so every commodity has a known, comparable
+            # ceiling on RICs-per-expiry no matter how tightly or widely its
+            # strikes are spaced.
+            uniq_strikes = meta["strike"].drop_duplicates()
+            n_strikes_before = len(uniq_strikes)
+            if n_strikes_before > max_strikes:
+                nearest = uniq_strikes.iloc[(uniq_strikes - atm).abs().argsort()[:max_strikes]]
+                keep_strikes = set(nearest)
+                before = len(meta)
+                meta = meta[meta["strike"].isin(keep_strikes)].reset_index(drop=True)
+                log.info("MAX-STRIKES: kept nearest %d of %d strikes to ATM (%s) — %d -> %d candidate RICs",
+                         max_strikes, n_strikes_before, atm, before, len(meta))
 
         all_rics = meta["ric"].tolist()
         log.info("ATM (%s): %s | candidate RICs: %d | strikes %g-%g (%d distinct) | expiries: %d",

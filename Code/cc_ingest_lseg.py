@@ -41,6 +41,9 @@ BATCH_SIZE        = 50
 # open interest (237 -> 164 strikes, losing <5% of OI). Caps real rate-limit
 # cost from deep wings nobody is actually positioned in.
 MAX_STRIKE_PCT    = 100
+# Hard cap on strike count, nearest to ATM — tighter than MAX_STRIKE_PCT alone,
+# gives every commodity the same known ceiling on RICs regardless of board shape.
+MAX_STRIKES       = 100
 
 PARQUET_PATH = DB_DIR / "CC_options_ice.parquet"
 ATM_JSON     = DASH_DIR / "atm.json"
@@ -76,7 +79,7 @@ def main():
         force_full=args.full, use_discovery=not args.legacy_window,
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, no_topup=args.no_topup,
-        active_only=args.active_only, max_strike_pct=MAX_STRIKE_PCT,
+        active_only=args.active_only, max_strike_pct=MAX_STRIKE_PCT, max_strikes=MAX_STRIKES,
     )
 
 

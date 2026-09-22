@@ -53,6 +53,9 @@ MONTHS_FORWARD    = 8       # ~4 years of listed expiries at 6 months/year... ac
 BACKFILL_DAYS     = 90
 ROLLING_DAYS      = 10
 BATCH_SIZE        = 50
+# Hard cap on strike count, nearest to ATM kept — same rate-limit control
+# applied across all 6 commodities.
+MAX_STRIKES       = 100
 
 PARQUET_PATH = DB_DIR / "LRC_options_ice.parquet"
 ATM_JSON     = DASH_DIR / "atm.json"
@@ -89,7 +92,7 @@ def main():
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, ric_prefix=RIC_PREFIX,
         allowed_months=ALLOWED_MONTHS, atm_field=ATM_FIELD, no_topup=args.no_topup,
-        exchange_code=EXCHANGE_CODE, active_only=args.active_only,
+        exchange_code=EXCHANGE_CODE, active_only=args.active_only, max_strikes=MAX_STRIKES,
     )
 
 
