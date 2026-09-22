@@ -270,11 +270,11 @@ def discover_meta(ld, include_weeklies: bool = False) -> pd.DataFrame:
     d["StrikePrice"] = pd.to_numeric(d["StrikePrice"], errors="coerce")
     name = d["DTSubjectName"].astype(str)
     d = d[name.str.contains(SEARCH_NAME_RE, case=False, na=False)]
-    log.info("Search: %d rows after %s name filter", len(d), SEARCH_NAME_RE)
+    log.info("Found %d possible KC listings", len(d))
 
     # keep only contracts that have not expired, and drop the strike=0 artifacts
     live = d[(d["ExpiryDate"] > today) & (d["StrikePrice"] > 0)]
-    log.info("Search: %d live (unexpired, strike>0)", len(live))
+    log.info("%d of those are currently active (not expired)", len(live))
 
     parsed = [p for p in (parse_ric(x) for x in live["RIC"].unique()) if p]
     meta = pd.DataFrame(parsed)
@@ -283,12 +283,11 @@ def discover_meta(ld, include_weeklies: bool = False) -> pd.DataFrame:
 
     n_week = int((meta["series"] != "monthly").sum())
     if include_weeklies:
-        log.info("Universe: %d monthly + %d weekly/serial (weeklies INCLUDED)",
+        log.info("%d real contracts + %d short-term ones (both included)",
                  len(meta) - n_week, n_week)
     else:
         meta = meta[meta["series"] == "monthly"].reset_index(drop=True)
-        log.info("Universe: %d monthly (excluded %d weekly/serial — they collide "
-                 "with monthlies on (strike, month, year))", len(meta), n_week)
+        log.info("%d real contracts found (skipped %d short-term ones)", len(meta), n_week)
 
     # cross-check the strike we decoded from the RIC against search metadata
     chk = meta.merge(live[["RIC", "StrikePrice", "CallPutOption"]].drop_duplicates("RIC"),
@@ -303,7 +302,7 @@ def discover_meta(ld, include_weeklies: bool = False) -> pd.DataFrame:
         log.warning("%d RICs where decoded call/put != search, e.g. %s",
                     len(bad_cp), bad_cp[["ric", "option_type", "CallPutOption"]].head(3).to_dict("records"))
     if not len(bad) and not len(bad_cp):
-        log.info("RIC decode cross-checked against search metadata: all %d agree", len(chk))
+        log.info("All %d contracts checked out fine", len(chk))
 
     return meta[["ric", "option_type", "strike", "expiry_month", "expiry_year", "series"]]
 
@@ -337,7 +336,7 @@ def prefilter_live(ld, rics: list, require_oi: bool = False) -> list:
         seen_px += int(px.notna().sum())
         keep = (oi > 0) if require_oi else ((oi > 0) | px.notna())
         live.extend(df[keep]["Instrument"].tolist())
-    log.info("  prefilter: %d with OI>0, %d with settle -> %d kept",
+    log.info("  %d have open positions, %d have a live price -> %d kept overall",
              seen_oi, seen_px, len(live))
     return live
 
@@ -432,7 +431,7 @@ def topup_open_interest(ld, parquet_path: Path) -> int:
 
     need = df[(df["date"] == target) & df["settle"].notna() & df["oi"].isna()]
     if need.empty:
-        log.info("OI already complete for %s", target.date())
+        log.info("OI already complete for %s — nothing to fill in", target.date())
         return 0
 
     rics = sorted(need["ric"].unique())
@@ -442,7 +441,7 @@ def topup_open_interest(ld, parquet_path: Path) -> int:
         try:
             snaps.append(ld.get_data(universe=batch, fields=["OPINT_1"]))
         except Exception as e:
-            log.warning("  OI top-up quote batch failed: %s", str(e)[:120])
+            log.warning("  Couldn't check yesterday's positions (OI top-up quote failed): %s", str(e)[:120])
     if not snaps:
         return 0
     snap = pd.concat(snaps, ignore_index=True).set_index("Instrument")["OPINT_1"]
@@ -452,13 +451,13 @@ def topup_open_interest(ld, parquet_path: Path) -> int:
 
     comparable = [r for r in rics if pd.notna(prev_oi.get(r)) and pd.notna(snap.get(r))]
     if not comparable:
-        log.info("OI top-up: no RIC with a prior OI to check the quote against — "
-                 "skipped, left for the historical fetch")
+        log.info("Can't check yet — no RIC with a prior OI to compare against. "
+                 "Will catch up on the next regular fetch.")
         return 0
     moved = [r for r in comparable if abs(float(snap[r]) - float(prev_oi[r])) >= 1]
     if len(moved) * 2 < len(comparable):
-        log.info("OI top-up: only %d/%d comparable RICs show a changed OI — "
-                 "%s not published yet, left for the next run", len(moved), len(comparable), target.date())
+        log.info("Checked yesterday's positions: only %d of %d contracts show a change — "
+                 "%s not published yet, will check again next time", len(moved), len(comparable), target.date())
         return 0
 
     filled = 0
@@ -472,7 +471,8 @@ def topup_open_interest(ld, parquet_path: Path) -> int:
         df["oi"] = df["oi"].astype("Int64")
         df = df.sort_values(["ric", "date"]).reset_index(drop=True)
         df.to_parquet(parquet_path, index=False)
-        log.info("OI top-up: filled OI on %s for %d contract(s) (%d/%d comparable moved)",
+        log.info("OI top-up: filled OI on %s for %d contract(s) — yesterday's data is now complete "
+                 "(%d of %d checked contracts had moved)",
                  target.date(), filled, len(moved), len(comparable))
     return filled
 
@@ -500,19 +500,19 @@ def main():
     args = parser.parse_args()
 
     log.info("=" * 60)
-    log.info("KC Options Ingest (LSEG) | %s", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    log.info("Starting KC (Coffee) update — %s", datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
 
     import lseg.data as ld
     ld.open_session()
-    log.info("LSEG session opened.")
+    log.info("Connected to LSEG.")
 
     try:
         first_run   = args.full or not PARQUET_PATH.exists()
         window_days = args.days if args.days else (BACKFILL_DAYS if first_run else ROLLING_DAYS)
         fetch_start = (today - pd.Timedelta(days=window_days)).strftime("%Y-%m-%d")
         fetch_end   = today.strftime("%Y-%m-%d")
-        log.info("Mode: %s | window: %s -> %s (%dd)",
-                 "FULL" if first_run else "INCREMENTAL", fetch_start, fetch_end, window_days)
+        log.info("%s — checking %s to %s (%d days)",
+                 "Full rebuild" if first_run else "Daily update", fetch_start, fetch_end, window_days)
 
         atm = get_atm_strike(ld)
 
@@ -531,14 +531,14 @@ def main():
                      ATM_RIC, atm, strikes[0], strikes[-1], len(strikes), len(months))
 
         all_rics = meta["ric"].tolist()
-        log.info("ATM (%s): %s | candidate RICs: %d | strikes %g-%g (%d distinct) | expiries: %d",
-                 ATM_RIC, atm, len(all_rics), meta["strike"].min(), meta["strike"].max(),
-                 meta["strike"].nunique(),
+        log.info("Current price: %s | Found %d possible contracts (%d strike prices, %d expiry dates)",
+                 atm, len(all_rics), meta["strike"].nunique(),
                  meta.groupby(["expiry_year", "expiry_month"]).ngroups)
 
         t0 = time.time()
         live_rics = prefilter_live(ld, all_rics, require_oi=args.require_oi)
-        log.info("Quoted RICs: %d / %d (%.0fs)", len(live_rics), len(all_rics), time.time() - t0)
+        log.info("%d of %d contracts are actually live and tradeable (checked in %.0fs)",
+                 len(live_rics), len(all_rics), time.time() - t0)
 
         skipped_rics = []
         if args.active_only and PARQUET_PATH.exists():
@@ -556,10 +556,9 @@ def main():
             newly = set(live_rics) - set(prev["ric"])
             trimmed = [r for r in live_rics if r in active or r in newly]
             if trimmed:
-                log.info("ACTIVE-ONLY: %d of %d RICs traded or held OI in the last %dd "
-                         "(+%d newly listed) — est. %.0fs instead of %.0fs",
-                         len(trimmed), len(live_rics), ACTIVE_LOOKBACK, len(newly),
-                         len(trimmed) * 0.2075, len(live_rics) * 0.2075)
+                log.info("Only updating %d of %d contracts that are actually active "
+                         "(+%d new listings) — skipping the quiet ones to save time",
+                         len(trimmed), len(live_rics), len(newly))
                 # The RICs we are choosing NOT to fetch must be protected exactly
                 # like a failed batch: the incremental upsert clears the refresh
                 # window before writing, so without this their recent rows would
@@ -607,22 +606,29 @@ def main():
                 missing = [r for r in batch if r not in set(df["ric"].unique())]
                 if missing:
                     partial_rics.extend(missing)
-                log.info("  batch %d/%d: %d rows (%d/%d RICs with data%s)", b_num, n_batches,
-                         len(df), df["ric"].nunique(), len(batch),
-                         f", {len(missing)} not returned — preserved" if missing else "")
+                # Progress shown every 5 batches (not every single one) so the
+                # screen doesn't fill with repetitive lines — same information,
+                # just less of it. Anything that actually needs attention
+                # (a connection issue, missing contracts) is still reported below.
+                if b_num % 5 == 0 or b_num == n_batches:
+                    log.info("  Fetching price history... %d%% done (%d/%d)",
+                             int(b_num / n_batches * 100), b_num, n_batches)
             elif definitive:
-                log.info("  batch %d/%d: no data", b_num, n_batches)
+                pass  # genuinely no data for this batch — routine, not worth a line
             else:
                 failed_rics.extend(batch)
-                log.warning("  batch %d/%d: UNRESOLVED — existing rows for these %d RICs will be preserved",
+                # Kept live and visible (not batched up for later) — this is
+                # the line that shows a rate-limit problem AS it's happening,
+                # not just in a summary after the fact.
+                log.warning("  Connection issue on batch %d/%d — %d contracts affected, keeping their old data",
                             b_num, n_batches, len(batch))
-        log.info("History fetch complete in %.0fs", time.time() - t0)
+        log.info("Finished fetching in %.0fs", time.time() - t0)
         if failed_rics:
-            log.warning("%d RICs could not be fetched this run (%d batches); their history is kept as-is.",
-                        len(failed_rics), (len(failed_rics) + BATCH_SIZE - 1) // BATCH_SIZE)
+            log.warning("%d contracts had a connection issue this run — kept their existing data instead of losing it.",
+                        len(failed_rics))
         if partial_rics:
-            log.warning("%d RICs were requested but not returned by an otherwise-successful batch; "
-                        "their existing rows are preserved rather than cleared.", len(partial_rics))
+            log.warning("%d contracts didn't come back with data this run — kept their existing data instead of losing it.",
+                        len(partial_rics))
 
         if not all_dfs:
             log.error("No data returned from any batch.")
@@ -690,14 +696,13 @@ def main():
             prev_rows = len(pd.read_parquet(PARQUET_PATH))
             delta = len(final) - prev_rows
             if delta < 0:
-                log.warning("Row count fell by %d (%d -> %d) — expected only if "
-                            "contracts expired out of the universe.",
+                log.warning("Lost %d rows (%d -> %d) — should only happen when old contracts expire.",
                             -delta, prev_rows, len(final))
             else:
-                log.info("Row count %d -> %d (%+d)", prev_rows, len(final), delta)
+                log.info("Added %d new rows (now %d total)", delta, len(final))
             if len(final) < prev_rows * 0.9:
-                log.error("Refusing to write: %d rows vs %d existing (>10%% shrink). "
-                          "Parquet left untouched.", len(final), prev_rows)
+                log.error("STOPPED: new data has %d rows vs %d existing — too big a drop, "
+                          "so nothing was saved (protecting existing data).", len(final), prev_rows)
                 sys.exit(1)
 
         final.to_parquet(PARQUET_PATH, index=False)
@@ -713,25 +718,26 @@ def main():
         atm_data["updated"] = today.strftime("%Y-%m-%d")
         ATM_JSON.write_text(json.dumps(atm_data))
 
-        log.info("Saved -> %s | %d rows | %s -> %s | %d RICs",
-                  PARQUET_PATH.name, len(final), final["date"].min().date(), final["date"].max().date(),
+        log.info("Saved! %d rows, covering %s to %s, %d contracts total",
+                  len(final), final["date"].min().date(), final["date"].max().date(),
                   final["ric"].nunique())
         calls = final[final["option_type"] == "Call"]["ric"].nunique()
         puts  = final[final["option_type"] == "Put"]["ric"].nunique()
-        log.info("Calls: %d | Puts: %d | impvol non-null: %d/%d", calls, puts, final["impvol"].notna().sum(), len(final))
-        log.info("Strikes: %d distinct, %g - %g", final["strike"].nunique(),
+        log.info("%d call options, %d put options (%d of %d rows have implied volatility)",
+                 calls, puts, final["impvol"].notna().sum(), len(final))
+        log.info("%d different strike prices, from %g to %g", final["strike"].nunique(),
                  final["strike"].min(), final["strike"].max())
         last_oi = final[final["oi"].notna()]
         if len(last_oi):
             d_oi = last_oi["date"].max()
             tot = last_oi[last_oi["date"] == d_oi]["oi"].sum()
-            log.info("Latest OI date: %s | total OI across board: %s lots",
+            log.info("Latest open positions data: %s (%s total contracts open)",
                      d_oi.date(), f"{tot:,}")
 
         if not args.no_topup:
             filled = topup_open_interest(ld, PARQUET_PATH)
             if filled:
-                log.info("OI top-up: %d contract(s) filled for the prior session", filled)
+                log.info("Filled in yesterday's open positions data for %d contract(s)", filled)
     finally:
         ld.close_session()
 
