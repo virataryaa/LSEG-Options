@@ -79,6 +79,11 @@ def main():
                         help="Fetch only RICs that carried OI or volume in the last 10 days. "
                              "Cuts the run's RIC count (and rate-limit exposure); settle-only "
                              "wings then refresh whenever you run a full (non-active-only) sweep.")
+    parser.add_argument("--strike-skip", type=int, default=0,
+                        help="Skip this many strikes nearest to ATM before applying MAX_STRIKES — "
+                             "fetches the NEXT band outward for a staged rollout.")
+    parser.add_argument("--max-strikes", type=int, default=None,
+                        help="Override MAX_STRIKES for this run (the '+N more' pass of a staged rollout).")
     args = parser.parse_args()
 
     log = c.make_logger("lrc_ingest_lseg", Path(__file__).parent / "logs")
@@ -92,7 +97,9 @@ def main():
         include_weeklies=args.weeklies, require_oi=args.require_oi,
         dry_run=args.dry_run, days=args.days, ric_prefix=RIC_PREFIX,
         allowed_months=ALLOWED_MONTHS, atm_field=ATM_FIELD, no_topup=args.no_topup,
-        exchange_code=EXCHANGE_CODE, active_only=args.active_only, max_strikes=MAX_STRIKES,
+        exchange_code=EXCHANGE_CODE, active_only=args.active_only,
+        max_strikes=(args.max_strikes if args.max_strikes is not None else MAX_STRIKES),
+        strike_skip=args.strike_skip,
     )
 
 

@@ -240,11 +240,87 @@ streamlit run Dashboard/app.py
 Requires an authenticated LSEG Workspace/Eikon session on the host running
 the ingest scripts.
 
+## Rate-limit incident (2026-09-17 to 2026-09-21) — root causes and fixes
+
+LSEG started returning "Too many requests" on 2026-09-17, eventually blocking
+even single lightweight calls for over a day. Root causes found, and the
+fix for each:
+
+1. **A duplicate, un-disabled scheduled task.** The original single
+   automator (`run.bat` / `run_updater.py`, all 6 commodities, no
+   `--active-only`) kept firing daily on its own Task Scheduler entry
+   even after being replaced by `run_london.bat`/`run_nyc.bat` — so every
+   commodity was being fetched via **two** full runs a day, one of them
+   with none of the rate-limit fixes below. `run_updater.py` is now a
+   stub that logs and exits without ever opening an LSEG session, so this
+   can't recur even if a stale task fires it again. The old scheduled
+   task itself still had to be found and deleted by hand (confirmed done
+   2026-09-21) — a code fix alone can't remove a Task Scheduler entry.
+2. **LRC/LCC search results exceeding LSEG's 10,000-row cap.** Both
+   commodities skip the `1` RIC-disambiguator prefix (see "Where the RIC
+   scheme came from" above), so `startswith(RIC,'LRC')` / `'LCC'` also
+   matched unrelated instruments sharing the same root — confirmed live:
+   Lam Research Corp equity options under `LRC*` (true match count
+   12,357, over the cap) and several unrelated ICE Europe instruments
+   under `LCC*` (13,980, also over the cap). Fixed by adding an
+   `ExchangeCode='IEU'` filter to the search (`exchange_code` param on
+   `discover_meta`/`run_ingest`) — cut LRC to 3,207 rows and LCC to 6,603,
+   both safely under the cap. KC/CC/SB/CT keep their `1` prefix and were
+   confirmed *not* to hit the cap (KC: 2,127 total, all genuine
+   ICE US/CBT/IOM) — `exchange_code` stays unset for those.
+3. **RIC count is the actual rate-limit lever, not the fetch window.**
+   Measured: a 10-day vs 90-day `get_history` window costs almost the
+   same wall time per RIC (payload is nearly free); the cost is linear in
+   *how many RICs* you ask about. Three trims were added on this basis,
+   all applied to the discovered universe before prefilter/fetch, all
+   verified against synthetic data before touching production files:
+   - `MAX_EXPIRIES` (Cotton only, =9): Cotton was found to genuinely list
+     24 distinct expiries out to mid-2029 (vs KC's 9) — capped to the
+     nearest 9.
+   - `MAX_STRIKE_PCT` (CC/LCC, =100): both list strikes 3x+ ATM away;
+     strikes within ±100% of ATM already capture 95%+ of total open
+     interest everywhere.
+   - `MAX_STRIKES` (all 6, =100): a harder cap than the above — keeps
+     exactly the N strikes nearest to ATM by distance, regardless of
+     board shape, so every commodity has the same known ceiling on
+     RICs-per-expiry. Applied 2026-09-21/22; all 6 parquets trimmed to
+     match immediately (e.g. LCC 236→100 strikes, KC 128→100).
+   - A `--strike-skip`/`--max-strikes` CLI override pair also exists on
+     every ingest script, for fetching a *later, separate* outward band
+     (e.g. `--strike-skip 100 --max-strikes 50` = ranks 101-150) without
+     re-fetching the inner band already on file — built 2026-09-23 for a
+     possible staged "100 now, +50 later" rollout, **not yet used or
+     scheduled** (paused pending a decision on whether wider coverage is
+     actually wanted, since the wings beyond ±100 strikes are the same
+     low-OI ones `MAX_STRIKES` was built to cut).
+4. **Partial-batch data loss**, unrelated to the rate limit itself but
+   found during the same investigation: a batch can succeed while
+   silently returning fewer RICs than requested (not "failed"), and
+   without protecting those RICs the incremental upsert clears their
+   refresh window with nothing to write back — this is what actually
+   caused CT/SB to lose rows on 2026-09-15. Fixed in both
+   `kc_ingest_lseg.py` and `_common.py` (`partial_rics` tracking, folded
+   into the same protect-set as `failed_rics`).
+5. **Live-streamed ingest output.** The automator used to buffer all
+   subprocess output until the ingest script exited
+   (`subprocess.run(capture_output=True)`), so a 26-minute rate-limited
+   KC run showed a blank cmd window the entire time. Switched to
+   `Popen` + line-by-line streaming so batch progress is visible as it
+   happens — this is what let the LRC 429 be seen and diagnosed live
+   rather than only after the fact.
+
+Net effect measured across all 6: roughly 12,016 → 8,425 RICs per full
+sweep (~30% fewer requests) from the MAX_STRIKES cap alone, on top of the
+daily `--active-only` trim and the duplicate-run fix.
+
 ## Next steps
 
 - LSU (White Sugar) is the one remaining ICE-Europe commodity not yet
   built — same empirical-discovery approach as LRC/LCC.
 - Deployed to GitHub (`virataryaa/interim-migration-Options`). Streamlit
   Cloud deploy + homepage (`icebreaker.html`) link, once a URL is available.
-- Task Scheduler (cmd.exe basic task calling `run.bat`, "run only when
-  logged on") — after a health-check run.
+- Task Scheduler: two separate tasks now (`run_london.bat` ~12:30pm,
+  `run_nyc.bat` ~4:10pm via `_automator_common.py`) — done 2026-09-21.
+- Decide whether to actually run the paused `--strike-skip` staged
+  rollout (see incident notes above) for wider-than-±100-strike coverage,
+  or leave `MAX_STRIKES=100` as the permanent ceiling.

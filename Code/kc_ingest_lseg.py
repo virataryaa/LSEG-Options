@@ -498,6 +498,13 @@ def main():
                         help="Report universe and coverage, then exit without writing the parquet")
     parser.add_argument("--no-topup", action="store_true",
                         help="Skip the post-save real-time-quote OI top-up for the prior session")
+    parser.add_argument("--strike-skip", type=int, default=0,
+                        help="Skip this many strikes nearest to ATM before applying MAX_STRIKES — "
+                             "e.g. --strike-skip 100 fetches the NEXT band outward instead of the "
+                             "innermost strikes again, for a staged rollout.")
+    parser.add_argument("--max-strikes", type=int, default=None,
+                        help="Override MAX_STRIKES for this run (e.g. --strike-skip 100 --max-strikes 50 "
+                             "fetches ranks 101-150 — the '+50 more' pass of a staged rollout).")
     args = parser.parse_args()
 
     log.info("=" * 60)
@@ -531,19 +538,33 @@ def main():
             log.info("ATM (%s): %s | legacy window strikes %s-%s (%d) x %d months",
                      ATM_RIC, atm, strikes[0], strikes[-1], len(strikes), len(months))
 
-        if MAX_STRIKES:
+        effective_max_strikes = args.max_strikes if args.max_strikes is not None else MAX_STRIKES
+        if effective_max_strikes:
             # Hard cap on strike COUNT, centered on ATM — same mechanism as
             # _common.py's max_strikes for the other 5 commodities, kept here
             # too since KC's ingest logic stands alone.
+            #
+            # args.strike_skip lets a later, separate run fetch the NEXT band
+            # outward instead of the same innermost strikes again — e.g.
+            # --strike-skip 100 --max-strikes 50 fetches ranks 101-150,
+            # so a staged "100 now, +50 later" rollout only asks LSEG for
+            # strikes it doesn't already have.
             uniq_strikes = meta["strike"].drop_duplicates()
             n_strikes_before = len(uniq_strikes)
-            if n_strikes_before > MAX_STRIKES:
-                nearest = uniq_strikes.iloc[(uniq_strikes - atm).abs().argsort()[:MAX_STRIKES]]
-                keep_strikes = set(nearest)
+            ranked = uniq_strikes.iloc[(uniq_strikes - atm).abs().argsort()]
+            band = ranked.iloc[args.strike_skip:args.strike_skip + effective_max_strikes]
+            if len(band) < n_strikes_before or args.strike_skip:
+                keep_strikes = set(band)
                 before = len(meta)
                 meta = meta[meta["strike"].isin(keep_strikes)].reset_index(drop=True)
-                log.info("Only keeping the %d strikes closest to the current price (%s) — %d -> %d candidate contracts",
-                         MAX_STRIKES, atm, before, len(meta))
+                if args.strike_skip:
+                    log.info("Skipping the %d strikes closest to the price, keeping the next %d "
+                             "(ranks %d-%d of %d) — %d -> %d candidate contracts",
+                             args.strike_skip, len(band), args.strike_skip + 1,
+                             args.strike_skip + len(band), n_strikes_before, before, len(meta))
+                else:
+                    log.info("Only keeping the %d strikes closest to the current price (%s) — %d -> %d candidate contracts",
+                             effective_max_strikes, atm, before, len(meta))
 
         all_rics = meta["ric"].tolist()
         log.info("Current price: %s | Found %d possible contracts (%d strike prices, %d expiry dates)",

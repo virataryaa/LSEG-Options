@@ -461,7 +461,8 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
                 use_discovery: bool = True, include_weeklies: bool = False,
                 require_oi: bool = False, dry_run: bool = False, days: int = None,
                 no_topup: bool = False, exchange_code: str = None, active_only: bool = False,
-                max_expiries: int = None, max_strike_pct: float = None, max_strikes: int = None):
+                max_expiries: int = None, max_strike_pct: float = None, max_strikes: int = None,
+                strike_skip: int = 0):
     """Shared main-loop body. Returns the final DataFrame written to parquet.
     ric_prefix: '1' for KC/CC/SB/CT-style RICs, '' for LRC/LCC (root is already
     unambiguous, no disambiguator prefix — confirmed live via discovery.search).
@@ -538,15 +539,29 @@ def run_ingest(commodity: str, atm_ric: str, strike_gap: float, strike_steps: in
             # board is shaped, so every commodity has a known, comparable
             # ceiling on RICs-per-expiry no matter how tightly or widely its
             # strikes are spaced.
+            #
+            # strike_skip lets a later, separate run fetch the NEXT band
+            # outward instead of the same innermost strikes again — e.g.
+            # strike_skip=100, max_strikes=50 fetches ranks 101-150 by
+            # distance from ATM, so a staged "100 now, +50 later" rollout
+            # only ever asks LSEG for the strikes it doesn't already have,
+            # rather than re-fetching the inner 100 every time.
             uniq_strikes = meta["strike"].drop_duplicates()
             n_strikes_before = len(uniq_strikes)
-            if n_strikes_before > max_strikes:
-                nearest = uniq_strikes.iloc[(uniq_strikes - atm).abs().argsort()[:max_strikes]]
-                keep_strikes = set(nearest)
+            ranked = uniq_strikes.iloc[(uniq_strikes - atm).abs().argsort()]
+            band = ranked.iloc[strike_skip:strike_skip + max_strikes]
+            if len(band) < n_strikes_before or strike_skip:
+                keep_strikes = set(band)
                 before = len(meta)
                 meta = meta[meta["strike"].isin(keep_strikes)].reset_index(drop=True)
-                log.info("MAX-STRIKES: kept nearest %d of %d strikes to ATM (%s) — %d -> %d candidate RICs",
-                         max_strikes, n_strikes_before, atm, before, len(meta))
+                if strike_skip:
+                    log.info("MAX-STRIKES: skipped nearest %d, kept the next %d strikes to ATM "
+                             "(ranks %d-%d of %d, ATM=%s) — %d -> %d candidate RICs",
+                             strike_skip, len(band), strike_skip + 1, strike_skip + len(band),
+                             n_strikes_before, atm, before, len(meta))
+                else:
+                    log.info("MAX-STRIKES: kept nearest %d of %d strikes to ATM (%s) — %d -> %d candidate RICs",
+                             max_strikes, n_strikes_before, atm, before, len(meta))
 
         all_rics = meta["ric"].tolist()
         log.info("ATM (%s): %s | candidate RICs: %d | strikes %g-%g (%d distinct) | expiries: %d",
